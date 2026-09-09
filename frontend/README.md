@@ -1,6 +1,12 @@
-# Welcome to your Expo app 👋
+# GridLink (Expo app)
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+This app talks to the Second Life grid directly — no backend server. See
+`src/sl/` for the login/LLUDP/capability implementation.
+
+> **No Expo Go.** The app opens a raw UDP socket (`react-native-udp`) to the
+> sim server, which Expo Go's sandbox doesn't allow. Use a dev client build
+> instead: `npx expo run:android`, `npx expo run:ios`, or
+> `eas build --profile development`.
 
 ## Get started
 
@@ -10,7 +16,13 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    npm install
    ```
 
-2. Start the app
+2. Build and run a dev client (first time, or after adding a native module)
+
+   ```bash
+   npx expo run:android   # or: npx expo run:ios
+   ```
+
+3. On later runs, just start Metro and reopen the installed dev client
 
    ```bash
    npx expo start
@@ -21,7 +33,6 @@ In the output, you'll find options to open the app in a
 - [development build](https://docs.expo.dev/develop/development-builds/introduction/)
 - [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
 - [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
