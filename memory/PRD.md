@@ -21,7 +21,17 @@ pick an avatar name and drive the same UI against seeded local data.
   4s polling of the active channel. IM chips = online friends + IM history;
   Group chips = real groups; "ALL (n)" chip opens a searchable ScopePicker.
 - Friends tab with live online-status (30s presence poll), All/Online
-  filter, rights icons, tap → IM that friend, account-plus → resident search
+  filter, rights icons, tap → IM that friend, account-plus → resident search,
+  FRIENDSHIP OFFERS cards (ACCEPT sends AcceptFriendship, DECLINE sends
+  DeclineFriendship over the circuit)
+- Unread badges: `src/unread.ts` store polls `/api/chat/unread` every 8s →
+  CHAT tab badge, IM/GROUP segment badges, per-chip badges; viewing a scope
+  posts `/api/chat/mark_read`
+- Radar screen: live avatars in the region from CoarseLocationUpdate
+  (distance, bearing, friend flag, tap → IM), 5s poll
+- Reconnect: LINK badge (Chat) / RECONNECT TO GRID (More) call
+  `POST /api/reconnect` which re-runs the login with the stored `$1$md5`
+  hash, keeps session_id + chat history, restarts the circuit
 - Search screen: AvatarPickerSearch cap (grid) / mock directory (offline),
   ADD sends a FriendshipOffered IM over the circuit
 - Inventory tab with hierarchical folder tree, expand/collapse, per-type icons
@@ -39,6 +49,7 @@ pick an avatar name and drive the same UI against seeded local data.
 - `POST /api/login/grid`, `POST /api/login/offline`, `POST /api/logout`
 - `GET /api/session`, `/api/status` (circuit state), `/api/friends`, `/api/groups`, `/api/inventory`
 - `GET /api/im/conversations`, `GET /api/search/residents?q=`, `POST /api/friends/request`, `POST /api/friends/refresh_names`
+- `GET /api/friends/requests`, `POST /api/friends/requests/{id}/accept|decline`, `GET /api/radar`, `GET /api/chat/unread`, `POST /api/chat/mark_read`, `POST /api/reconnect`
 - `GET /api/chat?session_id&channel&scope` (scope = "local" | agent UUID | group UUID), `POST /api/chat/send`
 - `GET /api/diagnostics?grid=agni|aditi`, `GET /api/grids`
 
@@ -47,6 +58,4 @@ pick an avatar name and drive the same UI against seeded local data.
   A backend restart drops the circuit; `/api/status` then reports
   `no circuit` and the user must log in again. SL allows one circuit per
   avatar, so always logout before re-logging.
-- Incoming friendship offers are surfaced as system lines in Local chat;
-  accepting them in-app is not built yet.
 - Test account (grid): see `/app/memory/test_credentials.md`.

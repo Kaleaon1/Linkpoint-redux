@@ -1,15 +1,24 @@
-"""GridLink backend regression tests (iteration 2).
+"""GridLink backend regression tests (iteration 3).
 
-Covers new features: groups per-session, IM conversations, resident search,
-friend requests (offline), presence status, grid circuit login (real account).
+Covers iteration-3 features: friend request accept/decline, radar in offline,
+unread counts + mark_read, reconnect gating, logout clears friend_requests +
+read_marks. Also keeps prior offline suites + grid-live suite.
 """
 import os
 import time
+from datetime import datetime, timezone
 import pytest
 import requests
+from dotenv import dotenv_values
+from pymongo import MongoClient
 
-BASE_URL = os.environ["EXPO_PUBLIC_BACKEND_URL"].rstrip("/")
+_ENV = dotenv_values("/app/backend/.env")
+_FE_ENV = dotenv_values("/app/frontend/.env")
+BASE_URL = (os.environ.get("EXPO_PUBLIC_BACKEND_URL") or _FE_ENV.get("EXPO_PUBLIC_BACKEND_URL", "")).rstrip("/")
 API = f"{BASE_URL}/api"
+
+_MONGO = MongoClient(_ENV["MONGO_URL"])
+DB = _MONGO[_ENV["DB_NAME"]]
 
 # Real Second Life credentials from /app/memory/test_credentials.md
 GRID_FIRST = "Kaleaon"
@@ -164,6 +173,172 @@ class TestLocalChatEcho:
         assert any(m.get("system") for m in msgs)
 
 
+# --- Iteration 3: Friend requests accept / decline (offline)
+class TestFriendRequestsOffline:
+    def _fresh(self, client, name):
+        r = client.post(f"{API}/login/offline", json={"avatar_name": name}, timeout=15)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def test_pending_request_seeded(self, client):
+        s = self._fresh(client, "TEST_ReqSeed")
+        sid = s["session_id"]
+        try:
+            r = client.get(f"{API}/friends/requests", params={"session_id": sid}, timeout=15)
+            assert r.status_code == 200
+            reqs = r.json()
+            assert len(reqs) == 1
+            assert reqs[0]["from_name"] == "Oz Linden"
+            assert reqs[0]["status"] == "pending"
+            assert reqs[0]["message"]
+        finally:
+            client.post(f"{API}/logout", params={"session_id": sid}, timeout=15)
+
+    def test_decline_removes_request(self, client):
+        s = self._fresh(client, "TEST_ReqDecline")
+        sid = s["session_id"]
+        try:
+            reqs = client.get(f"{API}/friends/requests", params={"session_id": sid}, timeout=15).json()
+            rid = reqs[0]["id"]
+            friends_before = len(client.get(f"{API}/friends", params={"session_id": sid}, timeout=15).json())
+            r = client.post(f"{API}/friends/requests/{rid}/decline", params={"session_id": sid}, timeout=15)
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["status"] == "declined"
+            # list becomes empty
+            assert client.get(f"{API}/friends/requests", params={"session_id": sid}, timeout=15).json() == []
+            # friend count unchanged
+            friends_after = client.get(f"{API}/friends", params={"session_id": sid}, timeout=15).json()
+            assert len(friends_after) == friends_before
+            assert not any(f["name"] == "Oz Linden" for f in friends_after)
+            # decline again -> 404
+            r2 = client.post(f"{API}/friends/requests/{rid}/decline", params={"session_id": sid}, timeout=15)
+            assert r2.status_code == 404
+        finally:
+            client.post(f"{API}/logout", params={"session_id": sid}, timeout=15)
+
+    def test_accept_adds_friend(self, client):
+        s = self._fresh(client, "TEST_ReqAccept")
+        sid = s["session_id"]
+        try:
+            reqs = client.get(f"{API}/friends/requests", params={"session_id": sid}, timeout=15).json()
+            rid = reqs[0]["id"]
+            r = client.post(f"{API}/friends/requests/{rid}/accept", params={"session_id": sid}, timeout=15)
+            assert r.status_code == 200, r.text
+            assert r.json()["status"] == "accepted"
+            friends = client.get(f"{API}/friends", params={"session_id": sid}, timeout=15).json()
+            assert len(friends) == 6
+            assert any(f["name"] == "Oz Linden" for f in friends)
+            # accepting again -> 404
+            r2 = client.post(f"{API}/friends/requests/{rid}/accept", params={"session_id": sid}, timeout=15)
+            assert r2.status_code == 404
+        finally:
+            client.post(f"{API}/logout", params={"session_id": sid}, timeout=15)
+
+
+# --- Iteration 3: Radar (offline)
+class TestRadarOffline:
+    def test_radar_offline_shape(self, client, offline_session):
+        sid = offline_session["session_id"]
+        r = client.get(f"{API}/radar", params={"session_id": sid}, timeout=15)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["region_name"] == "GridLink Sandbox"
+        assert d["connected"] is True
+        assert d["my_position"] == [128.0, 128.0, 24.0]
+        avs = d["avatars"]
+        assert len(avs) == 5
+        # Sorted by distance ascending
+        dists = [a["distance"] for a in avs]
+        assert dists == sorted(dists)
+        # is_friend flags: Ruth/Governor/Magnum online friends should be flagged
+        friend_names = {a["name"] for a in avs if a["is_friend"]}
+        assert friend_names >= {"Ruth Resident", "Governor Linden", "Magnum Resident",
+                                "Torley Linden", "Philip Linden"}
+        for a in avs:
+            assert isinstance(a["distance"], (int, float))
+            assert a["name"]
+
+
+# --- Iteration 3: Unread counts + mark_read (offline)
+class TestUnreadOffline:
+    def test_unread_lifecycle(self, client):
+        r = client.post(f"{API}/login/offline", json={"avatar_name": "TEST_Unread"}, timeout=15)
+        s = r.json()
+        sid = s["session_id"]
+        try:
+            # empty initially
+            assert client.get(f"{API}/chat/unread", params={"session_id": sid}, timeout=15).json() == []
+
+            # Pick a friend as peer
+            peer = client.get(f"{API}/friends", params={"session_id": sid}, timeout=15).json()[0]
+
+            # Own send should NOT count as unread
+            own = client.post(f"{API}/chat/send", json={
+                "session_id": sid, "channel": "im", "scope": peer["id"],
+                "scope_name": peer["name"], "text": "my own msg",
+            }, timeout=15)
+            assert own.status_code == 200
+            assert client.get(f"{API}/chat/unread", params={"session_id": sid}, timeout=15).json() == []
+
+            # Insert a foreign IM directly into Mongo
+            DB.chat.insert_one({
+                "id": "test-foreign-1",
+                "session_id": sid,
+                "channel": "im",
+                "scope": peer["id"],
+                "scope_name": peer["name"],
+                "sender": peer["name"],
+                "sender_id": peer["id"],
+                "text": "hi from peer",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "system": False,
+            })
+            unread = client.get(f"{API}/chat/unread", params={"session_id": sid}, timeout=15).json()
+            assert len(unread) == 1
+            e = unread[0]
+            assert e["channel"] == "im"
+            assert e["scope"] == peer["id"]
+            assert e["count"] == 1
+
+            # Mark read -> empty
+            mr = client.post(f"{API}/chat/mark_read", json={
+                "session_id": sid, "channel": "im", "scope": peer["id"],
+            }, timeout=15)
+            assert mr.status_code == 200
+            time.sleep(0.5)
+            assert client.get(f"{API}/chat/unread", params={"session_id": sid}, timeout=15).json() == []
+        finally:
+            client.post(f"{API}/logout", params={"session_id": sid}, timeout=15)
+
+
+# --- Iteration 3: Reconnect gating (offline) + logout cleans new collections
+class TestReconnectAndLogoutCleanup:
+    def test_reconnect_offline_400(self, client, offline_session):
+        sid = offline_session["session_id"]
+        r = client.post(f"{API}/reconnect", params={"session_id": sid}, timeout=15)
+        assert r.status_code == 400
+
+    def test_status_offline_cannot_reconnect(self, client, offline_session):
+        sid = offline_session["session_id"]
+        d = client.get(f"{API}/status", params={"session_id": sid}, timeout=15).json()
+        assert d.get("can_reconnect") is False
+
+    def test_logout_clears_requests_and_marks(self, client):
+        r = client.post(f"{API}/login/offline", json={"avatar_name": "TEST_LogoutClean"}, timeout=15)
+        sid = r.json()["session_id"]
+        # mark a read + confirm friend_requests seeded
+        client.post(f"{API}/chat/mark_read", json={"session_id": sid, "channel": "im", "scope": "x"}, timeout=15)
+        assert DB.friend_requests.count_documents({"session_id": sid}) >= 1
+        assert DB.read_marks.count_documents({"session_id": sid}) >= 1
+        r2 = client.post(f"{API}/logout", params={"session_id": sid}, timeout=15)
+        assert r2.status_code == 200
+        assert DB.friend_requests.count_documents({"session_id": sid}) == 0
+        assert DB.read_marks.count_documents({"session_id": sid}) == 0
+
+
+
+
 # --- Grid mode: REAL account. Run ONCE, then logout. Do NOT parallelize.
 class TestGridLive:
     """Real Second Life circuit test. Marked serial via module fixtures.
@@ -245,3 +420,44 @@ class TestGridLive:
             "session_id": sid, "channel": "local", "scope": "local", "text": "GridLink automated test",
         }, timeout=20)
         assert r.status_code == 200, r.text
+
+
+    def test_status_can_reconnect(self, client, grid_session):
+        sid = grid_session["session_id"]
+        d = client.get(f"{API}/status", params={"session_id": sid}, timeout=15).json()
+        assert d.get("connected") is True
+        assert d.get("can_reconnect") is True
+
+    def test_radar_live(self, client, grid_session):
+        sid = grid_session["session_id"]
+        r = client.get(f"{API}/radar", params={"session_id": sid}, timeout=20)
+        assert r.status_code == 200
+        d = r.json()
+        assert d["connected"] is True
+        assert d["region_name"]
+        assert d["my_position"] is not None
+        for a in d["avatars"]:
+            assert a["name"]
+            assert isinstance(a["distance"], (int, float, type(None)))
+
+    def test_z_reconnect_same_session(self, client, grid_session):
+        # 'z' prefix so this test runs last within the class (after radar/groups/chat)
+        sid = grid_session["session_id"]
+        groups_before = client.get(f"{API}/groups", params={"session_id": sid}, timeout=30).json()
+        r = client.post(f"{API}/reconnect", params={"session_id": sid}, timeout=60)
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert data["session_id"] == sid, "reconnect must reuse session id"
+        connected = False
+        st = {}
+        for _ in range(15):
+            time.sleep(1)
+            st = client.get(f"{API}/status", params={"session_id": sid}, timeout=15).json()
+            if st.get("connected") and st.get("region_name"):
+                connected = True
+                break
+        assert connected, f"did not reconnect (last status: {st})"
+        time.sleep(4)
+        groups_after = client.get(f"{API}/groups", params={"session_id": sid}, timeout=30).json()
+        assert len(groups_after) > 0
+        assert len(groups_after) >= max(1, len(groups_before) - 5)

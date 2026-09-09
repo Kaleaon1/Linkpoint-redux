@@ -61,6 +61,7 @@ export type CircuitStatus = {
   mode: "grid" | "offline";
   connected: boolean;
   closed?: boolean;
+  can_reconnect?: boolean;
   error?: string | null;
   region_name?: string | null;
   avatar_name?: string;
@@ -69,6 +70,27 @@ export type CircuitStatus = {
   uptime_s?: number;
   events?: string[];
 };
+
+export type FriendRequestIn = { id: string; from_id: string; from_name: string; message: string; ts: string; status: string };
+
+export type RadarAvatar = { id: string; name: string; x: number; y: number; z: number; distance: number | null; is_friend: boolean };
+export type RadarResponse = {
+  region_name: string | null;
+  connected: boolean;
+  my_position: number[] | null;
+  updated_ago_s: number | null;
+  avatars: RadarAvatar[];
+};
+
+export type UnreadEntry = { channel: "im" | "group"; scope: string; scope_name?: string | null; count: number };
+
+/** Re-run the grid handshake for the saved session and refresh the stored session fields. */
+export async function reconnectSession(s: Session): Promise<Session> {
+  const resp = await api.post<any>(`/reconnect?session_id=${s.session_id}`, {});
+  const next: Session = { ...s, avatar_name: resp.avatar_name, agent_id: resp.agent_id, region: resp.region, login_message: resp.login_message };
+  await saveSession(next);
+  return next;
+}
 
 /** A thing you can talk to on the IM or Group channel. */
 export type ScopeTarget = { id: string; name: string; online?: boolean; kind: "im" | "group"; last_ts?: string };

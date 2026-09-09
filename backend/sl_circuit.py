@@ -56,6 +56,7 @@ def _fixed(n: int) -> bytes:
 MSG_START_PING = _high(1)
 MSG_COMPLETE_PING = _high(2)
 MSG_AGENT_UPDATE = _high(4)
+MSG_COARSE_LOCATION = _med(6)
 MSG_CHAT_FROM_SIM = _med(139)
 MSG_USE_CIRCUIT = _low(3)
 MSG_CHAT_FROM_VIEWER = _low(80)
@@ -63,6 +64,8 @@ MSG_AGENT_THROTTLE = _low(81)
 MSG_REGION_HANDSHAKE = _low(148)
 MSG_REGION_HANDSHAKE_REPLY = _low(149)
 MSG_KICK_USER = _low(163)
+MSG_ACCEPT_FRIENDSHIP = _low(297)
+MSG_DECLINE_FRIENDSHIP = _low(298)
 MSG_COMPLETE_MOVEMENT = _low(249)
 MSG_MOVEMENT_COMPLETE = _low(250)
 MSG_LOGOUT_REQUEST = _low(252)
@@ -234,6 +237,11 @@ class Circuit:
         self.seen: deque = deque(maxlen=4000)
         self.seen_set: set = set()
         self.group_sessions: set = set()
+        # radar: agent_id -> (x, y, z) from CoarseLocationUpdate; my own position too
+        self.nearby: Dict[str, tuple] = {}
+        self.my_pos: Optional[tuple] = None
+        self.nearby_updated = 0.0
+        self.name_cache: Dict[str, str] = {}
 
         self.started_at = time.time()
         self.last_rx = 0.0
@@ -405,6 +413,13 @@ class Circuit:
             time.sleep(0.4)
         self.send_im(group_id, text, dialog=IM_SESSION_SEND, im_id=group_id)
 
+    def accept_friendship(self, transaction_id: str, calling_card_folder: str = ZERO_UUID) -> None:
+        body = MSG_ACCEPT_FRIENDSHIP + U(self.agent_id) + U(self.sl_session_id) + U(transaction_id) + bytes([1]) + U(calling_card_folder)
+        self._send(body, reliable=True)
+
+    def decline_friendship(self, transaction_id: str) -> None:
+        self._send(MSG_DECLINE_FRIENDSHIP + U(self.agent_id) + U(self.sl_session_id) + U(transaction_id), reliable=True)
+
     def request_friendship(self, agent_id: str, message: str) -> None:
         self.send_im(agent_id, message or "Would you be my friend?", dialog=IM_FRIENDSHIP_OFFERED, im_id=str(uuid.uuid4()))
 
@@ -504,6 +519,23 @@ class Circuit:
                 self.connected = True
                 self._event("agent movement complete - in world")
                 self._send(MSG_RETRIEVE_IMS + U(self.agent_id) + U(self.sl_session_id), reliable=True)
+        elif mid == MSG_COARSE_LOCATION:
+            n = r.u8()
+            locs = [(r.u8(), r.u8(), r.u8() * 4) for _ in range(n)]
+            you = struct.unpack_from("<h", r.b, r.i)[0]
+            r.skip(4)  # You, Prey (S16 each)
+            ids = [r.uuid() for _ in range(r.u8())]
+            nearby: Dict[str, tuple] = {}
+            for idx, aid in enumerate(ids):
+                if idx < len(locs):
+                    nearby[aid] = locs[idx]
+            if 0 <= you < len(locs):
+                self.my_pos = locs[you]
+            elif self.agent_id in nearby:
+                self.my_pos = nearby[self.agent_id]
+            nearby.pop(self.agent_id, None)
+            self.nearby = nearby
+            self.nearby_updated = time.time()
         elif mid == MSG_CHAT_FROM_SIM:
             self._on_chat(r)
         elif mid == MSG_IM:
@@ -581,6 +613,12 @@ class Circuit:
         elif dialog in (IM_MESSAGE_FROM_AGENT, IM_MESSAGE_FROM_OBJECT):
             self._insert_chat("im", from_id, from_name, from_name, from_id, message)
         elif dialog == IM_FRIENDSHIP_OFFERED:
+            self.db.friend_requests.update_one(
+                {"session_id": self.session_id, "id": im_id},
+                {"$set": {"id": im_id, "session_id": self.session_id, "from_id": from_id, "from_name": from_name,
+                          "message": message, "ts": _now(), "status": "pending"}},
+                upsert=True,
+            )
             self._system(f"{from_name} has offered you friendship: {message or '(no message)'}")
         elif dialog == IM_FRIENDSHIP_ACCEPTED:
             self.db.friends.update_one(

@@ -10,7 +10,7 @@ import {
   ScrollView,
   ActivityIndicator,
 } from "react-native";
-import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
+import { useIsFocused, useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Icon from "@react-native-vector-icons/material-design-icons";
 import * as Haptics from "expo-haptics";
@@ -18,6 +18,7 @@ import * as Haptics from "expo-haptics";
 import {
   api,
   loadSession,
+  reconnectSession,
   type Session,
   type Friend,
   type Group,
@@ -26,6 +27,7 @@ import {
   type ScopeTarget,
 } from "@/src/api";
 import { ScopePicker } from "@/src/components/scope-picker";
+import { markRead, refreshUnread, unreadFor, unreadForChannel, useUnread } from "@/src/unread";
 import { colors, makeStyles, monoFont, displayFont } from "@/src/theme";
 
 type Channel = "local" | "im" | "group";
@@ -64,8 +66,11 @@ export default function ChatScreen() {
   const [pickerOpen, setPickerOpen] = useState(false);
   // Peer opened from Friends tab / search that may be offline and have no history yet.
   const [pinned, setPinned] = useState<ScopeTarget | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const { entries: unread } = useUnread();
   const listRef = useRef<FlatList<Msg>>(null);
-  const focused = useRef(false);
+  const isFocused = useIsFocused();
+  const loadKey = useRef("");
 
   useEffect(() => {
     loadSession().then(setSession);
@@ -126,10 +131,11 @@ export default function ChatScreen() {
     [groups],
   );
 
-  const targets = useMemo<ScopeTarget[]>(
-    () => (channel === "im" ? imTargets : channel === "group" ? groupTargets : []),
-    [channel, imTargets, groupTargets],
-  );
+  const targets = useMemo<ScopeTarget[]>(() => {
+    const base = channel === "im" ? imTargets : channel === "group" ? groupTargets : [];
+    // Anything with unread messages floats to the front of the chip row.
+    return [...base].sort((a, b) => unreadFor(unread, channel, b.id) - unreadFor(unread, channel, a.id));
+  }, [channel, imTargets, groupTargets, unread]);
   const scopeName = useMemo(() => {
     if (channel === "local") return "local";
     return targets.find((t) => t.id === scope)?.name ?? messages.find((m) => m.scope_name)?.scope_name ?? "";
@@ -148,15 +154,18 @@ export default function ChatScreen() {
 
   const load = useCallback(
     async (silent = false) => {
-      if (!session || !scope) {
+      if (!session || !scope || (channel !== "local" && scope === "local")) {
         setMessages([]);
         return;
       }
       if (!silent) setLoading(true);
+      const key = `${channel}|${scope}`;
+      loadKey.current = key;
       try {
         const msgs = await api.get<Msg[]>(
           `/chat?session_id=${session.session_id}&channel=${channel}&scope=${encodeURIComponent(scope)}`,
         );
+        if (loadKey.current !== key) return; // a newer channel/scope superseded this request
         setMessages((prev) => (prev.length === msgs.length && prev[prev.length - 1]?.id === msgs[msgs.length - 1]?.id ? prev : msgs));
       } catch {
         // keep last good list
@@ -167,24 +176,38 @@ export default function ChatScreen() {
     [session, channel, scope],
   );
 
+  // Viewing a scope (while this tab is focused) clears its unread badge.
+  useEffect(() => {
+    if (isFocused && channel !== "local" && scope && unreadFor(unread, channel, scope) > 0) markRead(channel, scope);
+  }, [isFocused, channel, scope, unread]);
+
+  const reconnect = async () => {
+    if (!session || session.mode !== "grid" || reconnecting) return;
+    setReconnecting(true);
+    setSendError(null);
+    try {
+      const next = await reconnectSession(session);
+      setSession(next);
+      await loadRoster(next);
+      refreshUnread();
+    } catch (e: any) {
+      setSendError(`reconnect failed: ${e?.message ?? "unknown"}`);
+    } finally {
+      setReconnecting(false);
+    }
+  };
+
   useEffect(() => {
     load();
   }, [load]);
 
   // Live: poll the active channel while this tab is focused.
-  useFocusEffect(
-    useCallback(() => {
-      focused.current = true;
-      load(true);
-      const t = setInterval(() => {
-        if (focused.current) load(true);
-      }, CHAT_POLL_MS);
-      return () => {
-        focused.current = false;
-        clearInterval(t);
-      };
-    }, [load]),
-  );
+  useEffect(() => {
+    if (!isFocused) return;
+    load(true);
+    const t = setInterval(() => load(true), CHAT_POLL_MS);
+    return () => clearInterval(t);
+  }, [isFocused, load]);
 
   const send = async () => {
     const body = text.trim();
@@ -222,19 +245,28 @@ export default function ChatScreen() {
             {session ? `> ${session.avatar_name} @ ${region}` : "> connecting..."}
           </Text>
         </View>
-        <View testID="link-status" style={[styles.link, connected ? styles.linkOn : styles.linkOff]}>
-          <View style={[styles.linkDot, { backgroundColor: connected ? colors.success : colors.error }]} />
-          <Text style={[styles.linkTxt, { color: connected ? colors.success : colors.error }]}>
-            {status ? (connected ? "LINK" : "NO LINK") : "..."}
+        <Pressable
+          testID="link-status"
+          onPress={reconnect}
+          disabled={connected || session?.mode !== "grid" || reconnecting}
+          style={[styles.link, connected ? styles.linkOn : styles.linkOff]}
+        >
+          {reconnecting ? (
+            <ActivityIndicator size="small" color={colors.warning} />
+          ) : (
+            <View style={[styles.linkDot, { backgroundColor: connected ? colors.success : colors.error }]} />
+          )}
+          <Text style={[styles.linkTxt, { color: reconnecting ? colors.warning : connected ? colors.success : colors.error }]}>
+            {reconnecting ? "RELINK" : status ? (connected ? "LINK" : status.can_reconnect ? "RECONNECT" : "NO LINK") : "..."}
           </Text>
-        </View>
+        </Pressable>
       </View>
 
       {/* Channel segmented */}
       <View style={styles.segment}>
         <Seg label="LOCAL" active={channel === "local"} onPress={() => setChannel("local")} testID="chan-local" />
-        <Seg label="IM" active={channel === "im"} onPress={() => setChannel("im")} testID="chan-im" />
-        <Seg label="GROUP" active={channel === "group"} onPress={() => setChannel("group")} testID="chan-group" />
+        <Seg label="IM" badge={unreadForChannel(unread, "im")} active={channel === "im"} onPress={() => setChannel("im")} testID="chan-im" />
+        <Seg label="GROUP" badge={unreadForChannel(unread, "group")} active={channel === "group"} onPress={() => setChannel("group")} testID="chan-group" />
       </View>
 
       {/* Scope chips */}
@@ -271,6 +303,11 @@ export default function ChatScreen() {
               <Text style={[styles.chipTxt, scope === t.id && styles.chipTxtActive]} numberOfLines={1}>
                 {t.name}
               </Text>
+              {unreadFor(unread, channel, t.id) > 0 && (
+                <View style={styles.badge} testID={`badge-${t.id}`}>
+                  <Text style={styles.badgeTxt}>{unreadFor(unread, channel, t.id)}</Text>
+                </View>
+              )}
             </Pressable>
           ))}
         </ScrollView>
@@ -349,11 +386,16 @@ export default function ChatScreen() {
   );
 }
 
-function Seg({ label, active, onPress, testID }: any) {
+function Seg({ label, active, onPress, testID, badge = 0 }: any) {
   const styles = useStyles();
   return (
     <Pressable onPress={onPress} testID={testID} style={[styles.segBtn, active && styles.segBtnActive]}>
       <Text style={[styles.segTxt, active && styles.segTxtActive]}>{label}</Text>
+      {badge > 0 && (
+        <View style={styles.segBadge} testID={`${testID}-badge`}>
+          <Text style={styles.badgeTxt}>{badge > 99 ? "99+" : badge}</Text>
+        </View>
+      )}
     </Pressable>
   );
 }
@@ -401,10 +443,13 @@ const useStyles = makeStyles((c) => ({
     borderRadius: 4,
     overflow: "hidden",
   },
-  segBtn: { flex: 1, paddingVertical: 10, alignItems: "center", backgroundColor: c.surfaceSecondary },
+  segBtn: { flex: 1, paddingVertical: 10, alignItems: "center", backgroundColor: c.surfaceSecondary, flexDirection: "row", justifyContent: "center", gap: 6 },
   segBtnActive: { backgroundColor: c.brandTertiary, borderBottomWidth: 2, borderBottomColor: c.brandPrimary },
   segTxt: { color: c.muted, fontFamily: monoFont, fontSize: 12, letterSpacing: 3 },
   segTxtActive: { color: c.brandPrimary },
+  segBadge: { minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 5, backgroundColor: c.brandSecondary, alignItems: "center", justifyContent: "center" },
+  badge: { minWidth: 18, height: 18, borderRadius: 9, paddingHorizontal: 5, backgroundColor: c.brandSecondary, alignItems: "center", justifyContent: "center" },
+  badgeTxt: { color: c.onBrandSecondary, fontFamily: monoFont, fontSize: 10, fontWeight: "700" },
   chipsScroll: { maxHeight: 56 },
   chipsRow: { paddingHorizontal: 16, paddingVertical: 10, gap: 8 },
   chip: {

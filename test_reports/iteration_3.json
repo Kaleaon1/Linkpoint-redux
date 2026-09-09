@@ -1,0 +1,28 @@
+{
+  "summary": "Iteration 3 GridLink test — all 4 new features pass on both backend and frontend. Backend pytest: 29/29 pass (20 offline + 9 grid-live vs REAL Kaleaon Resident @ agni). New: friend request seed / decline / accept flow (Oz Linden, list becomes empty on decline, friends count 6 on accept, second attempt = 404); radar returns 5 mock avatars sorted by distance from (128,128,24) with correct is_friend flags & region 'GridLink Sandbox'; unread lifecycle (empty → foreign IM inserted via pymongo raises count 1 → mark_read clears it; own /chat/send msgs do NOT count); /reconnect on offline session returns 400 and /status.can_reconnect=false; /api/logout also wipes friend_requests + read_marks. Grid-live: /status.can_reconnect=true, /radar returns connected=true with real region_name + my_position + avatars, and POST /reconnect returns 200 with the SAME session_id, reconnects within ~15s and preserves the group roster. Frontend (mobile viewport 390x844, offline mode): Friends tab renders 'FRIENDSHIP OFFERS (1)' card with message text, DECLINE (testID decline-<id>) and ACCEPT (testID accept-<id>) buttons; tapping ACCEPT removes the card and Oz Linden appears as the 6th friend row. Unread badges: after seeding a foreign IM + group message via pymongo for the live UI session, the CHAT bottom-tab shows a numeric badge (=2), the IM segment shows chan-im-badge '1', GROUP segment shows chan-group-badge '1'; after tapping IM segment (auto-selects Ruth Resident, the unread peer) the seeded 'Ping from the UI test seed' appears in the message list, chan-im-badge disappears within ~3.5s, and the CHAT tab badge drops to '1'. Radar (More → Radar): subtitle '> 5 avatars in region · 3 in chat range', REGION card 'GridLink Sandbox' with 'you @ <128, 128, 24> · updated 0s ago', 5 rows with bearing + distance pill + 'friend' badge, sorted ascending by distance (4m, 11m, 18m, 28m, 43m). Reconnect UI in offline mode: Chat header shows green 'LINK' badge only (no RECONNECT variant) and More tab has NO 'RECONNECT TO GRID' row. No React Native / deprecated-package issues found.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is now 1120 lines. Still readable but consider splitting friend-requests / radar / unread routes into a separate module in a future refactor.",
+    "The offline pending friend request from Oz Linden is seeded on EVERY /api/login/offline call; harmless because sessions are per-uuid, but if a user re-logs in the same avatar name they will always see it — matches iteration-3 spec.",
+    "TestGridLive still uses instance-method class-scoped fixture (PytestRemovedIn10Warning). Non-blocking, one-line fix later.",
+    "chat/unread queries all IM+group messages of the session and filters in Python by ts > read_mark — for very long histories a Mongo aggregation with $match on ts would be faster. Fine at current scale (offline demo, ~dozens of messages)."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "100% (29/29)", "frontend": "100%"},
+  "seed_data_creation": "Offline login seeds 5 friends, 12 inventory folders, 3 groups, 1 pending friend request (Oz Linden) per session. UI badge test injects one foreign IM + one foreign group message via pymongo directly into the `chat` collection for the live UI session_id; those messages are removed automatically when the UI session is logged out (logout wipes chat + friend_requests + read_marks).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend URL env var is EXPO_PUBLIC_BACKEND_URL (in /app/frontend/.env). Real SL grid creds live at /app/memory/test_credentials.md (Kaleaon Resident / SealofRassilon02 / agni) — SL allows only ONE live circuit per avatar so grid tests always logout and sleep ~3s. Session key in localStorage / AsyncStorage is 'gridlink.session'. To test unread badges, log in via UI, extract session_id from localStorage, then insert into Mongo chat collection with channel im/group, scope=<friend or group id>, sender_id != null, system=false, ts=now-iso. The IM segment auto-selects the peer with unread (sorted first). Radar my_position is fixed at (128,128,24) in offline. Chat header LINK badge is green in offline and never becomes RECONNECT there — RECONNECT only appears when a grid session's sim link is down.",
+  "rca_of_issue": "N/A — no bugs found."
+}

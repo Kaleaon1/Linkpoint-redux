@@ -21,6 +21,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import hashlib
+import math
 import socket
 import time
 import uuid
@@ -152,6 +153,46 @@ class FriendRequest(BaseModel):
     agent_id: str
     name: str = ""
     message: str = ""
+
+
+class FriendRequestIn(BaseModel):
+    id: str  # IM transaction id (needed for AcceptFriendship/DeclineFriendship)
+    from_id: str
+    from_name: str
+    message: str = ""
+    ts: str
+    status: str = "pending"
+
+
+class RadarAvatar(BaseModel):
+    id: str
+    name: str
+    x: float
+    y: float
+    z: float
+    distance: Optional[float] = None
+    is_friend: bool = False
+
+
+class RadarResponse(BaseModel):
+    region_name: Optional[str]
+    connected: bool
+    my_position: Optional[List[float]]
+    updated_ago_s: Optional[float]
+    avatars: List[RadarAvatar]
+
+
+class UnreadEntry(BaseModel):
+    channel: str
+    scope: str
+    scope_name: Optional[str] = None
+    count: int
+
+
+class MarkReadRequest(BaseModel):
+    session_id: str
+    channel: str
+    scope: str
 
 
 class Friend(BaseModel):
@@ -379,6 +420,10 @@ async def login_offline(req: OfflineLoginRequest):
     await db.friends.insert_many([{**f, "session_id": session_id} for f in friends])
     await db.inventory.insert_many([{**i, "session_id": session_id} for i in inventory])
     await db.groups.insert_many([{**g, "session_id": session_id} for g in _default_groups()])
+    await db.friend_requests.insert_one({
+        "id": str(uuid.uuid4()), "session_id": session_id, "from_id": _md5("Oz Linden"), "from_name": "Oz Linden",
+        "message": "Hey! Met you at the sandbox - add me?", "ts": datetime.now(timezone.utc).isoformat(), "status": "pending",
+    })
 
     return LoginResponse(
         ok=True,
@@ -392,11 +437,14 @@ async def login_offline(req: OfflineLoginRequest):
     )
 
 
-@api.post("/login/grid", response_model=LoginResponse)
-async def login_grid(req: LoginRequest):
-    if req.grid not in GRIDS:
+async def _grid_login(*, first: str, last: str, passwd_hash: str, grid: str, start: str,
+                      agree_to_tos: bool, session_id: str) -> LoginResponse:
+    """Shared by /login/grid and /reconnect: XML-RPC login, roster/inventory
+    sync into Mongo under `session_id`, then open the sim circuit."""
+    if grid not in GRIDS:
         raise HTTPException(status_code=400, detail="Unknown grid")
-    login_uri = GRIDS[req.grid]["login_uri"]
+    login_uri = GRIDS[grid]["login_uri"]
+    req = LoginRequest(first=first, last=last, password="", grid=grid, start=start, agree_to_tos=agree_to_tos)
 
     mac = _stable_hex(f"mac::{req.first}::{req.last}")
     id0 = _stable_hex(f"id0::{req.first}::{req.last}")
@@ -404,7 +452,7 @@ async def login_grid(req: LoginRequest):
     payload = {
         "first": req.first,
         "last": req.last or "Resident",
-        "passwd": _sl_password(req.password),
+        "passwd": passwd_hash,
         "start": req.start,
         "channel": VIEWER_CHANNEL,
         "version": VIEWER_VERSION,
@@ -529,8 +577,8 @@ async def login_grid(req: LoginRequest):
     if not inventory:
         inventory = _default_inventory("grid")
 
-    session_id = str(uuid.uuid4())
     region = f"{region_x},{region_y}" if region_x is not None else None
+    calling_cards = next((i["id"] for i in inventory if i["type"] == "2"), None)
 
     session_doc = {
         "session_id": session_id,
@@ -546,15 +594,24 @@ async def login_grid(req: LoginRequest):
         "seed_capability": seed_cap,
         "caps": caps,
         "circuit_code": circuit_code,
+        "calling_cards_folder": calling_cards,
         "region_name": None,
+        # Kept so /reconnect can re-run the handshake (SL accepts the $1$md5 hash, never plaintext).
+        "login_creds": {"first": req.first, "last": req.last, "passwd_hash": passwd_hash, "grid": grid, "start": start},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    await db.sessions.insert_one(dict(session_doc))
+    # Reconnect re-uses the session_id so chat history survives; refresh roster & inventory.
+    await db.sessions.replace_one({"session_id": session_id}, session_doc, upsert=True)
+    await db.friends.delete_many({"session_id": session_id})
+    await db.inventory.delete_many({"session_id": session_id})
     if friends:
         await db.friends.insert_many([{**fr, "session_id": session_id} for fr in friends])
     await db.inventory.insert_many([{**it, "session_id": session_id} for it in inventory])
 
     # Open the sim UDP circuit (presence, groups, chat, IMs).
+    old = CIRCUITS.pop(session_id, None)
+    if old:
+        old.stop_requested = True
     if agent_id and sl_session and circuit_code and sim_ip and sim_port:
         try:
             circ = Circuit(
@@ -594,6 +651,38 @@ async def login_grid(req: LoginRequest):
     )
 
 
+@api.post("/login/grid", response_model=LoginResponse)
+async def login_grid(req: LoginRequest):
+    return await _grid_login(
+        first=req.first, last=req.last or "Resident", passwd_hash=_sl_password(req.password),
+        grid=req.grid, start=req.start, agree_to_tos=req.agree_to_tos, session_id=str(uuid.uuid4()),
+    )
+
+
+@api.post("/reconnect", response_model=LoginResponse)
+async def reconnect(session_id: str):
+    """Re-run the grid handshake for an existing session whose circuit died
+    (backend restart, sim timeout, kick). Keeps session_id + chat history."""
+    sess = await db.sessions.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if sess.get("mode") == "offline":
+        raise HTTPException(status_code=400, detail="Offline sessions have nothing to reconnect")
+    creds = sess.get("login_creds")
+    if not creds:
+        raise HTTPException(status_code=400, detail="No stored login for this session - log in again")
+    circ = CIRCUITS.get(session_id)
+    if circ and circ.connected and not circ.closed:
+        # Already live: tear it down first so SL releases the avatar's single circuit.
+        await asyncio.to_thread(circ.logout)
+        CIRCUITS.pop(session_id, None)
+        await asyncio.sleep(2)
+    return await _grid_login(
+        first=creds["first"], last=creds["last"], passwd_hash=creds["passwd_hash"],
+        grid=creds["grid"], start="last", agree_to_tos=True, session_id=session_id,
+    )
+
+
 @api.post("/logout")
 async def logout(session_id: str):
     circ = CIRCUITS.pop(session_id, None)
@@ -604,21 +693,149 @@ async def logout(session_id: str):
     await db.inventory.delete_many({"session_id": session_id})
     await db.chat.delete_many({"session_id": session_id})
     await db.groups.delete_many({"session_id": session_id})
+    await db.friend_requests.delete_many({"session_id": session_id})
+    await db.read_marks.delete_many({"session_id": session_id})
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Friend requests (incoming FriendshipOffered IMs captured by the circuit)
+# ---------------------------------------------------------------------------
+@api.get("/friends/requests", response_model=List[FriendRequestIn])
+async def list_friend_requests(session_id: str):
+    docs = await db.friend_requests.find({"session_id": session_id, "status": "pending"}, {"_id": 0}).sort("ts", -1).to_list(100)
+    return [FriendRequestIn(**d) for d in docs]
+
+
+async def _answer_friend_request(session_id: str, request_id: str, accept: bool):
+    sess = await db.sessions.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    fr = await db.friend_requests.find_one({"session_id": session_id, "id": request_id, "status": "pending"})
+    if not fr:
+        raise HTTPException(status_code=404, detail="Request not found or already answered")
+    if sess.get("mode") == "grid":
+        circ = CIRCUITS.get(session_id)
+        if not circ or not circ.connected:
+            raise HTTPException(status_code=503, detail="Not connected to the sim - reconnect first")
+        if accept:
+            await asyncio.to_thread(circ.accept_friendship, request_id, sess.get("calling_cards_folder") or "00000000-0000-0000-0000-000000000000")
+        else:
+            await asyncio.to_thread(circ.decline_friendship, request_id)
+    if accept:
+        await db.friends.update_one(
+            {"session_id": session_id, "id": fr["from_id"]},
+            {"$set": {"id": fr["from_id"], "name": fr["from_name"], "online": True,
+                      "can_see_me_online": True, "can_see_me_map": False, "can_modify_my_objects": False}},
+            upsert=True,
+        )
+    await db.friend_requests.update_one({"session_id": session_id, "id": request_id}, {"$set": {"status": "accepted" if accept else "declined"}})
+    await db.chat.insert_one(ChatMessage(
+        session_id=session_id, channel="local", scope="local", scope_name="Local Chat", sender="System",
+        text=f"You {'accepted' if accept else 'declined'} {fr['from_name']}'s friendship offer", system=True,
+    ).model_dump())
+    return {"ok": True, "status": "accepted" if accept else "declined", "friend_id": fr["from_id"]}
+
+
+@api.post("/friends/requests/{request_id}/accept")
+async def accept_friend_request(request_id: str, session_id: str):
+    return await _answer_friend_request(session_id, request_id, True)
+
+
+@api.post("/friends/requests/{request_id}/decline")
+async def decline_friend_request(request_id: str, session_id: str):
+    return await _answer_friend_request(session_id, request_id, False)
+
+
+# ---------------------------------------------------------------------------
+# Radar: CoarseLocationUpdate gives every avatar in the region (x, y, z*4)
+# ---------------------------------------------------------------------------
+@api.get("/radar", response_model=RadarResponse)
+async def radar(session_id: str):
+    sess = await db.sessions.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    friend_ids = {f["id"] async for f in db.friends.find({"session_id": session_id}, {"id": 1})}
+    if sess.get("mode") == "offline":
+        me = (128.0, 128.0, 24.0)
+        mock = [("Ruth Resident", 131, 130, 24), ("Governor Linden", 120, 136, 24), ("Torley Linden", 142, 118, 28), ("Magnum Resident", 110, 150, 24), ("Philip Linden", 160, 100, 32)]
+        avatars = [RadarAvatar(id=_md5(n), name=n, x=x, y=y, z=z, distance=round(math.dist(me, (x, y, z)), 1), is_friend=_md5(n) in friend_ids) for n, x, y, z in mock]
+        return RadarResponse(region_name="GridLink Sandbox", connected=True, my_position=list(me), updated_ago_s=0, avatars=sorted(avatars, key=lambda a: a.distance))
+    circ = CIRCUITS.get(session_id)
+    if not circ:
+        return RadarResponse(region_name=sess.get("region_name"), connected=False, my_position=None, updated_ago_s=None, avatars=[])
+    nearby = dict(circ.nearby)
+    me = circ.my_pos
+    # Names: friends from DB, everything else via GetDisplayNames (cached on the circuit).
+    names: Dict[str, str] = {f["id"]: f["name"] async for f in db.friends.find({"session_id": session_id, "id": {"$in": list(nearby)}}, {"id": 1, "name": 1})}
+    unknown = [a for a in nearby if a not in names and a not in circ.name_cache]
+    cap = (sess.get("caps") or {}).get("GetDisplayNames")
+    if unknown and cap:
+        recs = await asyncio.to_thread(_resolve_names, cap, unknown)
+        for aid, rec in recs.items():
+            circ.name_cache[aid] = _pretty_name(rec, aid)
+    avatars = []
+    for aid, (x, y, z) in nearby.items():
+        dist = round(math.dist(me, (x, y, z)), 1) if me else None
+        avatars.append(RadarAvatar(id=aid, name=names.get(aid) or circ.name_cache.get(aid) or f"Resident {aid[:8]}", x=x, y=y, z=z, distance=dist, is_friend=aid in friend_ids))
+    avatars.sort(key=lambda a: (a.distance is None, a.distance or 0))
+    return RadarResponse(
+        region_name=circ.region_name or sess.get("region_name"), connected=circ.connected,
+        my_position=list(me) if me else None,
+        updated_ago_s=round(time.time() - circ.nearby_updated, 1) if circ.nearby_updated else None,
+        avatars=avatars,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unread counts per IM / group scope
+# ---------------------------------------------------------------------------
+@api.get("/chat/unread", response_model=List[UnreadEntry])
+async def chat_unread(session_id: str):
+    sess = await db.sessions.find_one({"session_id": session_id}, {"agent_id": 1, "avatar_name": 1})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    marks = {(m["channel"], m["scope"]): m["ts"] async for m in db.read_marks.find({"session_id": session_id}, {"_id": 0})}
+    q: Dict[str, Any] = {"session_id": session_id, "channel": {"$in": ["im", "group"]}, "system": False}
+    if sess.get("agent_id"):
+        q["sender_id"] = {"$ne": sess["agent_id"]}
+    else:
+        q["sender"] = {"$ne": sess.get("avatar_name")}
+    counts: Dict[tuple, Dict[str, Any]] = {}
+    async for m in db.chat.find(q, {"_id": 0, "channel": 1, "scope": 1, "scope_name": 1, "ts": 1}):
+        key = (m["channel"], m["scope"])
+        if m["ts"] <= marks.get(key, ""):
+            continue
+        e = counts.setdefault(key, {"channel": m["channel"], "scope": m["scope"], "scope_name": m.get("scope_name"), "count": 0})
+        e["count"] += 1
+        e["scope_name"] = m.get("scope_name") or e["scope_name"]
+    return [UnreadEntry(**e) for e in counts.values()]
+
+
+@api.post("/chat/mark_read")
+async def chat_mark_read(req: MarkReadRequest):
+    await db.read_marks.update_one(
+        {"session_id": req.session_id, "channel": req.channel, "scope": req.scope},
+        {"$set": {"ts": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
     return {"ok": True}
 
 
 @api.get("/status")
 async def get_status(session_id: str):
     """Live sim-circuit state for a session (offline sessions report mode only)."""
-    sess = await db.sessions.find_one({"session_id": session_id}, {"_id": 0, "mode": 1, "region_name": 1, "avatar_name": 1})
+    sess = await db.sessions.find_one({"session_id": session_id}, {"_id": 0, "mode": 1, "region_name": 1, "avatar_name": 1, "login_creds": 1})
     if not sess:
         raise HTTPException(status_code=404, detail="Session not found")
     circ = CIRCUITS.get(session_id)
     if sess.get("mode") == "offline":
-        return {"mode": "offline", "connected": True, "region_name": "GridLink Sandbox", "avatar_name": sess.get("avatar_name")}
+        return {"mode": "offline", "connected": True, "can_reconnect": False, "region_name": "GridLink Sandbox", "avatar_name": sess.get("avatar_name")}
+    can_reconnect = bool(sess.get("login_creds"))
     if not circ:
-        return {"mode": "grid", "connected": False, "closed": True, "error": "no circuit (backend restarted?) - log in again", "region_name": sess.get("region_name"), "avatar_name": sess.get("avatar_name")}
-    return {"mode": "grid", "avatar_name": sess.get("avatar_name"), **circ.status()}
+        return {"mode": "grid", "connected": False, "closed": True, "can_reconnect": can_reconnect,
+                "error": "sim link lost (backend restarted)", "region_name": sess.get("region_name"), "avatar_name": sess.get("avatar_name")}
+    return {"mode": "grid", "avatar_name": sess.get("avatar_name"), "can_reconnect": can_reconnect, **circ.status()}
 
 
 @api.get("/groups", response_model=List[Group])

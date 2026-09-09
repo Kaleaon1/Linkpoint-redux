@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { View, Text, Pressable, ScrollView } from "react-native";
+import { View, Text, Pressable, ScrollView, ActivityIndicator } from "react-native";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Icon from "@react-native-vector-icons/material-design-icons";
 
-import { api, clearSession, loadSession, type Session, type CircuitStatus } from "@/src/api";
+import { api, clearSession, loadSession, reconnectSession, type Session, type CircuitStatus } from "@/src/api";
 import { colors, makeStyles, monoFont, displayFont } from "@/src/theme";
 
 export default function MoreScreen() {
@@ -13,13 +13,33 @@ export default function MoreScreen() {
   const router = useRouter();
   const [session, setSession] = useState<Session | null>(null);
   const [status, setStatus] = useState<CircuitStatus | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [reconnectError, setReconnectError] = useState<string | null>(null);
+
+  const refreshStatus = (s: Session) =>
+    api.get<CircuitStatus>(`/status?session_id=${s.session_id}`).then(setStatus).catch(() => {});
 
   useEffect(() => {
     loadSession().then((s) => {
       setSession(s);
-      if (s) api.get<CircuitStatus>(`/status?session_id=${s.session_id}`).then(setStatus).catch(() => {});
+      if (s) refreshStatus(s);
     });
   }, []);
+
+  const reconnect = async () => {
+    if (!session || reconnecting) return;
+    setReconnecting(true);
+    setReconnectError(null);
+    try {
+      const next = await reconnectSession(session);
+      setSession(next);
+      await refreshStatus(next);
+    } catch (e: any) {
+      setReconnectError(e?.message ?? "reconnect failed");
+    } finally {
+      setReconnecting(false);
+    }
+  };
 
   const logout = async () => {
     if (session) {
@@ -96,6 +116,19 @@ export default function MoreScreen() {
           k="sim link"
           v={status ? (status.connected ? `LIVE · ${status.rx_packets ?? 0} rx / ${status.tx_packets ?? 0} tx` : status.error ?? "down") : "-"}
         />
+        {session?.mode === "grid" && status && !status.connected && status.can_reconnect ? (
+          <Pressable testID="reconnect-button" onPress={reconnect} disabled={reconnecting} style={styles.reconnect}>
+            {reconnecting ? (
+              <ActivityIndicator size="small" color={colors.onBrandPrimary} />
+            ) : (
+              <>
+                <Icon name="lan-connect" size={16} color={colors.onBrandPrimary} />
+                <Text style={styles.reconnectTxt}>RECONNECT TO GRID</Text>
+              </>
+            )}
+          </Pressable>
+        ) : null}
+        {reconnectError ? <Text style={styles.reconnectErr}>{`> ${reconnectError}`}</Text> : null}
         {session?.login_message ? (
           <Text style={styles.motd}>{"> " + session.login_message}</Text>
         ) : null}
@@ -158,6 +191,18 @@ const useStyles = makeStyles((c) => ({
   kvK: { color: c.muted, fontFamily: monoFont, fontSize: 12 },
   kvV: { color: c.onSurfaceSecondary, fontFamily: monoFont, fontSize: 12, marginLeft: 12, maxWidth: "60%" },
   motd: { color: c.warning, fontFamily: monoFont, fontSize: 11, marginTop: 6 },
+  reconnect: {
+    marginTop: 8,
+    height: 44,
+    borderRadius: 4,
+    backgroundColor: c.brandPrimary,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  reconnectTxt: { color: c.onBrandPrimary, fontFamily: monoFont, fontSize: 12, letterSpacing: 3, fontWeight: "700" },
+  reconnectErr: { color: c.error, fontFamily: monoFont, fontSize: 11, marginTop: 4 },
   list: { borderWidth: 1, borderColor: c.border, borderRadius: 4, overflow: "hidden" },
   row: {
     flexDirection: "row",
