@@ -1,0 +1,167 @@
+{
+  "app_name": "GridLink",
+  "personality": "7 Dark-First Utility DARK",
+  "personality_one_liner": "A dense, dark, tactical terminal interface optimized for rapid communication and deep grid immersion.",
+  "color": {
+    "surface": "#050810",
+    "onSurface": "#E2E8F0",
+    "surfaceSecondary": "#0C1322",
+    "onSurfaceSecondary": "#B0BEC5",
+    "surfaceTertiary": "#141E30",
+    "onSurfaceTertiary": "#CFD8DC",
+    "surfaceInverse": "#00F0FF",
+    "onSurfaceInverse": "#050810",
+    "brand": "#00F0FF",
+    "onBrand": "#050810",
+    "brandPrimary": "#00F0FF",
+    "onBrandPrimary": "#050810",
+    "brandSecondary": "#B026FF",
+    "onBrandSecondary": "#FFFFFF",
+    "brandTertiary": "#1A3B5C",
+    "onBrandTertiary": "#00F0FF",
+    "success": "#00FF66",
+    "onSuccess": "#050810",
+    "warning": "#FFEA00",
+    "onWarning": "#050810",
+    "error": "#FF1744",
+    "onError": "#FFFFFF",
+    "info": "#29B6F6",
+    "onInfo": "#050810",
+    "border": "#1E2D4A",
+    "borderStrong": "#00F0FF",
+    "divider": "#121C2D",
+    "muted": "#64748B"
+  },
+  "typography": {
+    "displayFontFamily": "Rajdhani",
+    "textFontFamily": "Space Mono",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Handle spacing correctly dont have extra spaces where its not required, handle padding and margin corectly and subtle for buttons and components",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 4,
+    "md": 8,
+    "lg": 12,
+    "pill": 999
+  },
+  "shadow_tier": "0",
+  "navigation": "bottom_tabs",
+  "icon_set": "MaterialCommunityIcons",
+  "glassmorphism": {
+    "enabled": "false",
+    "do's": [
+      "Use solid dark surfaces with crisp borders"
+    ],
+    "dont's": [
+      "No blur or glass effects; keep the terminal aesthetic tactical and flat"
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Login",
+      "purpose": "Entry point for grid credentials or offline avatar name.",
+      "states": {
+        "loading": "Cyan blinking terminal block cursor.",
+        "empty": "N/A",
+        "error": "Monospace red text indicating connection failure."
+      },
+      "layout": "Full-bleed background image with top-to-bottom dark gradient scrim (100% opacity at bottom). Input fields and 'Connect' button pinned to bottom third. Rajdhani for title, Space Mono for inputs."
+    },
+    {
+      "name": "Chat",
+      "purpose": "Primary communication hub with segmented sub-tabs for Local, IM, and Group.",
+      "states": {
+        "loading": "Blinking underscore...",
+        "empty": "Terminal message: '> No local chat detected.'",
+        "error": "Connection lost banner."
+      },
+      "layout": "Fixed top segment control (Local/IM/Group) with cyan active border. Dense list of chat bubbles (sharp corners, sm radius, Space Mono text with timestamps). Fixed compose bar at bottom with cyan send button."
+    },
+    {
+      "name": "Friends",
+      "purpose": "View online/offline status and quick access to IM.",
+      "states": {
+        "loading": "Skeleton rows with subtle cyan pulse.",
+        "empty": "'> Friends list empty. Add users to database.'",
+        "error": "Error fetching grid presence."
+      },
+      "layout": "Dense flat list. Each row has a small status dot (neon green for online, muted for offline), avatar name, and a right-chevron to initiate IM. Divider lines between rows."
+    },
+    {
+      "name": "Inventory",
+      "purpose": "Hierarchical folder tree browser for user assets.",
+      "states": {
+        "loading": "Fetching inventory tree...",
+        "empty": "'> Inventory empty.'",
+        "error": "Failed to sync inventory."
+      },
+      "layout": "List layout with indentation indicating folder depth. Leading icons for asset types (box for Object, image for Texture, script-text for Script). Tap to expand/collapse folder."
+    },
+    {
+      "name": "More",
+      "purpose": "Navigation hub for Settings, Radar, and Diagnostics.",
+      "states": {
+        "loading": "...",
+        "empty": "...",
+        "error": "..."
+      },
+      "layout": "Simple icon + label list rows. Violet accent used on navigation icons."
+    },
+    {
+      "name": "Diagnostics",
+      "purpose": "Live view of grid connectivity, ping, and packet stats.",
+      "states": {
+        "loading": "Connecting to grid metrics...",
+        "empty": "No data.",
+        "error": "Metric feed offline."
+      },
+      "layout": "Dense 2-column grid. Monospace numeric readouts. Large latency gauge or colored text (Green < 100ms, Yellow > 100ms, Red > 300ms)."
+    }
+  ],
+  "images": {
+    "login_hero": {
+      "url": "https://images.unsplash.com/photo-1773429494448-1c13750ad80d?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzl8MHwxfHNlYXJjaHwxfHxkYXJrJTIwY3liZXJwdW5rJTIwbmV0d29yayUyMGdyaWR8ZW58MHx8fHwxNzg4OTYxNjQ5fDA&ixlib=rb-4.1.0&q=85",
+      "alt": "Abstract geometric pattern with glowing purple and green lines"
+    }
+  },
+  "instructions_to_main_agent": [
+    "CRITICAL: The prompt specifically overrides the ban on cyan/violet/navy. You MUST use the provided dark navy (#050810) and cyan (#00F0FF) / violet (#B026FF) accents for the cyberpunk aesthetic.",
+    "CRITICAL: Use 'Space Mono' for all chat bubbles, inputs, and diagnostic metrics. Use 'Rajdhani' for screen headers and tab labels.",
+    "CRITICAL: Implement the gradient-to-dark scrim pattern (top-to-bottom) on the Login screen behind the hero image. Ensure text and inputs contrast against the dark bottom 40%.",
+    "Keep borders sharp. Use radius_tokens.sm (4px) or md (8px) for inputs and chat bubbles. Do not use pill buttons unless explicitly required.",
+    "Chat bubbles should not be soft. Use surfaceSecondary for received messages and brandTertiary for sent messages, with sharp terminal-like corners.",
+    "In the Chat tab, build a custom segmented control for (Local, IM, Group). Do not use soft pills; use flat tabs with an active bottom border of brandPrimary.",
+    "For the Friends list, use MaterialCommunityIcons 'circle-slice-8' or similar for the online/offline presence indicator. Online = success color, Offline = muted color.",
+    "Inventory should use nested indentations (e.g., marginLeft based on depth) and distinct MaterialCommunityIcons for different item types (e.g., 'texture', 'cube-outline', 'tshirt-crew-outline').",
+    "Diagnostics screen must be extremely dense, mimicking a terminal monitor with stats and numbers aligned.",
+    "Do not implement glassmorphism or blur anywhere. This app uses solid dark surfaces with high-contrast text and dividers for a pure tactical utility feel.",
+    "Wire haptics to tab switches, send message, and expanding/collapsing inventory folders."
+  ]
+}
