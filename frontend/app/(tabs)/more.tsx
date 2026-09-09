@@ -4,7 +4,7 @@ import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Icon from "@react-native-vector-icons/material-design-icons";
 
-import { api, clearSession, loadSession, type Session } from "@/src/api";
+import { api, clearSession, loadSession, type Session, type CircuitStatus } from "@/src/api";
 import { colors, makeStyles, monoFont, displayFont } from "@/src/theme";
 
 export default function MoreScreen() {
@@ -12,9 +12,13 @@ export default function MoreScreen() {
   const styles = useStyles();
   const router = useRouter();
   const [session, setSession] = useState<Session | null>(null);
+  const [status, setStatus] = useState<CircuitStatus | null>(null);
 
   useEffect(() => {
-    loadSession().then(setSession);
+    loadSession().then((s) => {
+      setSession(s);
+      if (s) api.get<CircuitStatus>(`/status?session_id=${s.session_id}`).then(setStatus).catch(() => {});
+    });
   }, []);
 
   const logout = async () => {
@@ -86,8 +90,12 @@ export default function MoreScreen() {
         <KV k="avatar" v={session?.avatar_name ?? "-"} />
         <KV k="mode" v={session?.mode ?? "-"} />
         <KV k="grid" v={session?.grid ?? "-"} />
-        <KV k="region" v={session?.region ?? "-"} />
+        <KV k="region" v={status?.region_name ?? session?.region ?? "-"} />
         <KV k="agent_id" v={session?.agent_id?.slice(0, 12) ?? "-"} />
+        <KV
+          k="sim link"
+          v={status ? (status.connected ? `LIVE · ${status.rx_packets ?? 0} rx / ${status.tx_packets ?? 0} tx` : status.error ?? "down") : "-"}
+        />
         {session?.login_message ? (
           <Text style={styles.motd}>{"> " + session.login_message}</Text>
         ) : null}

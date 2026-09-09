@@ -42,6 +42,37 @@ export type Session = {
   login_message?: string;
 };
 
+export type Friend = {
+  id: string;
+  name: string;
+  online: boolean;
+  can_see_me_online: boolean;
+  can_see_me_map: boolean;
+  can_modify_my_objects: boolean;
+};
+
+export type Group = { id: string; name: string; insignia_id?: string | null; accept_notices: boolean };
+
+export type Conversation = { id: string; name: string; last_ts: string; last_text: string };
+
+export type SearchResult = { id: string; name: string; username: string; is_friend: boolean };
+
+export type CircuitStatus = {
+  mode: "grid" | "offline";
+  connected: boolean;
+  closed?: boolean;
+  error?: string | null;
+  region_name?: string | null;
+  avatar_name?: string;
+  rx_packets?: number;
+  tx_packets?: number;
+  uptime_s?: number;
+  events?: string[];
+};
+
+/** A thing you can talk to on the IM or Group channel. */
+export type ScopeTarget = { id: string; name: string; online?: boolean; kind: "im" | "group"; last_ts?: string };
+
 const KEY = "gridlink.session";
 
 export async function saveSession(s: Session) {

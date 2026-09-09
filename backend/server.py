@@ -26,12 +26,16 @@ import time
 import uuid
 import asyncio
 import xmlrpc.client
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 import requests
+from pymongo import MongoClient
+from urllib.parse import quote
+
+import llsd
+from sl_circuit import Circuit, CIRCUITS
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -39,6 +43,8 @@ load_dotenv(ROOT_DIR / ".env")
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
+# Sync handle for the UDP circuit threads (they can't use the async driver).
+sync_db = MongoClient(mongo_url)[os.environ["DB_NAME"]]
 
 app = FastAPI(title="GridLink SL Communicator")
 api = APIRouter(prefix="/api")
@@ -103,8 +109,10 @@ class ChatMessage(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
     channel: Literal["local", "im", "group"]
-    scope: str  # "local" | im peer name | group name
+    scope: str  # "local" | im peer agent id | group id
+    scope_name: Optional[str] = None
     sender: str
+    sender_id: Optional[str] = None
     text: str
     ts: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     system: bool = False
@@ -114,7 +122,36 @@ class SendMessageRequest(BaseModel):
     session_id: str
     channel: Literal["local", "im", "group"]
     scope: str
+    scope_name: Optional[str] = None
     text: str
+
+
+class Group(BaseModel):
+    id: str
+    name: str
+    insignia_id: Optional[str] = None
+    accept_notices: bool = True
+
+
+class Conversation(BaseModel):
+    id: str
+    name: str
+    last_ts: str
+    last_text: str
+
+
+class SearchResult(BaseModel):
+    id: str
+    name: str
+    username: str
+    is_friend: bool = False
+
+
+class FriendRequest(BaseModel):
+    session_id: str
+    agent_id: str
+    name: str = ""
+    message: str = ""
 
 
 class Friend(BaseModel):
@@ -182,43 +219,44 @@ def _clean(doc: Dict[str, Any]) -> Dict[str, Any]:
 #   4. Response is an LLSD map with `agents` array containing username /
 #      display_name / legacy_first_name / legacy_last_name
 # ---------------------------------------------------------------------------
-def _llsd_request_caps_body(caps: List[str]) -> str:
-    items = "".join(f"<string>{c}</string>" for c in caps)
-    return f'<?xml version="1.0" ?><llsd><array>{items}</array></llsd>'
+WANTED_CAPS = ["GetDisplayNames", "AvatarPickerSearch", "EventQueueGet", "ChatSessionRequest"]
 
 
-def _llsd_map_get(map_elem: ET.Element, key: str) -> Optional[ET.Element]:
-    children = list(map_elem)
-    for i, ch in enumerate(children):
-        if ch.tag == "key" and ch.text == key and i + 1 < len(children):
-            return children[i + 1]
-    return None
-
-
-def _llsd_first_text(map_elem: ET.Element, key: str) -> Optional[str]:
-    node = _llsd_map_get(map_elem, key)
-    return node.text if node is not None else None
-
-
-def _fetch_display_name_cap(seed_cap: str) -> Optional[str]:
+def _fetch_caps(seed_cap: str, names: List[str]) -> Dict[str, str]:
+    """POST an LLSD array of cap names to the seed cap; returns name -> url."""
     try:
         r = requests.post(
             seed_cap,
-            data=_llsd_request_caps_body(["GetDisplayNames"]),
+            data=llsd.dump(names),
             headers={"Content-Type": "application/llsd+xml"},
             timeout=10,
         )
         if r.status_code != 200:
             log.warning("seed cap returned %s", r.status_code)
-            return None
-        root = ET.fromstring(r.text)
-        m = root.find("map")
-        if m is None:
-            return None
-        return _llsd_first_text(m, "GetDisplayNames")
+            return {}
+        doc = llsd.parse(r.text) or {}
+        return {k: v for k, v in doc.items() if isinstance(v, str) and v.startswith("http")}
     except Exception as e:
-        log.warning("failed to resolve display-name cap: %s", e)
-        return None
+        log.warning("failed to fetch caps: %s", e)
+        return {}
+
+
+def _fetch_display_name_cap(seed_cap: str) -> Optional[str]:
+    return _fetch_caps(seed_cap, ["GetDisplayNames"]).get("GetDisplayNames")
+
+
+def _agent_records(agents: Any) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    for a in agents or []:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        out[str(a["id"]).lower()] = {
+            "username": a.get("username") or "",
+            "display_name": a.get("display_name") or "",
+            "legacy_first_name": a.get("legacy_first_name") or "",
+            "legacy_last_name": a.get("legacy_last_name") or "",
+        }
+    return out
 
 
 def _resolve_names(display_name_cap: str, ids: List[str]) -> Dict[str, Dict[str, str]]:
@@ -234,26 +272,20 @@ def _resolve_names(display_name_cap: str, ids: List[str]) -> Dict[str, Dict[str,
             if r.status_code != 200:
                 log.warning("GetDisplayNames returned %s", r.status_code)
                 continue
-            root = ET.fromstring(r.text)
-            m = root.find("map")
-            if m is None:
-                continue
-            agents_arr = _llsd_map_get(m, "agents")
-            if agents_arr is None:
-                continue
-            for agent_map in agents_arr.findall("map"):
-                a_id = _llsd_first_text(agent_map, "id") or ""
-                if not a_id:
-                    continue
-                out[a_id.lower()] = {
-                    "username": _llsd_first_text(agent_map, "username") or "",
-                    "display_name": _llsd_first_text(agent_map, "display_name") or "",
-                    "legacy_first_name": _llsd_first_text(agent_map, "legacy_first_name") or "",
-                    "legacy_last_name": _llsd_first_text(agent_map, "legacy_last_name") or "",
-                }
+            out.update(_agent_records((llsd.parse(r.text) or {}).get("agents")))
         except Exception as e:
             log.warning("name batch failed: %s", e)
     return out
+
+
+def _search_residents(cap: str, query: str) -> List[Dict[str, str]]:
+    """AvatarPickerSearch cap: GET ?page_size=N&names=<query>."""
+    sep = "&" if "?" in cap else "?"
+    r = requests.get(f"{cap}{sep}page_size=30&names={quote(query)}", timeout=10)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"AvatarPickerSearch returned {r.status_code}")
+    recs = _agent_records((llsd.parse(r.text) or {}).get("agents"))
+    return [{"id": k, "name": _pretty_name(v, k), "username": v["username"]} for k, v in recs.items()]
 
 
 def _pretty_name(rec: Dict[str, str], uuid_fallback: str) -> str:
@@ -308,6 +340,13 @@ def _default_friends() -> List[Dict[str, Any]]:
     ]
 
 
+def _default_groups() -> List[Dict[str, Any]]:
+    return [
+        {"id": _md5(f"group::{n}"), "name": n, "insignia_id": None, "accept_notices": True}
+        for n in ["The Sandbox", "Firestorm Support", "Builders Guild"]
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -339,6 +378,7 @@ async def login_offline(req: OfflineLoginRequest):
     await db.sessions.insert_one(dict(session_doc))
     await db.friends.insert_many([{**f, "session_id": session_id} for f in friends])
     await db.inventory.insert_many([{**i, "session_id": session_id} for i in inventory])
+    await db.groups.insert_many([{**g, "session_id": session_id} for g in _default_groups()])
 
     return LoginResponse(
         ok=True,
@@ -423,8 +463,10 @@ async def login_grid(req: LoginRequest):
     look_at = resp.get("look_at")
     seed_cap = resp.get("seed_capability")
     login_msg = resp.get("message")
+    circuit_code = resp.get("circuit_code")
 
-    # Buddy list -> friends (names come from GetDisplayNames cap below)
+    # Buddy list -> friends. Presence is NOT in the login response; it arrives
+    # as OnlineNotification over the sim circuit once we're in world.
     buddies = resp.get("buddy-list") or []
     friends: List[Dict[str, Any]] = []
     for b in buddies:
@@ -432,35 +474,38 @@ async def login_grid(req: LoginRequest):
             continue
         buddy_id = b.get("buddy_id") or str(uuid.uuid4())
         rights_given = int(b.get("buddy_rights_given", 0) or 0)
-        rights_has = int(b.get("buddy_rights_has", 0) or 0)
         friends.append({
             "id": buddy_id,
             "name": f"Resident {buddy_id[:8]}",
-            "online": bool(rights_has & 1),
+            "online": False,
             "can_see_me_online": bool(rights_given & 1),
             "can_see_me_map": bool(rights_given & 2),
             "can_modify_my_objects": bool(rights_given & 4),
         })
 
-    # Resolve display names via seed_capability -> GetDisplayNames.
-    if seed_cap and friends:
+    # Capabilities: display names, resident search, event queue.
+    caps: Dict[str, str] = {}
+    if seed_cap:
+        caps = await asyncio.to_thread(_fetch_caps, str(seed_cap), WANTED_CAPS)
+
+    # Resolve display names via GetDisplayNames.
+    cap_url = caps.get("GetDisplayNames")
+    if cap_url and friends:
         try:
-            cap_url = await asyncio.to_thread(_fetch_display_name_cap, str(seed_cap))
-            if cap_url:
-                ids = [f["id"] for f in friends]
-                names = await asyncio.to_thread(_resolve_names, cap_url, ids)
-                for f in friends:
-                    rec = names.get(f["id"].lower())
-                    if rec:
-                        f["name"] = _pretty_name(rec, f["id"])
-                # Refresh avatar_name from resolver too (display name > legacy)
-                if agent_id:
-                    self_rec = names.get(str(agent_id).lower())
-                    if not self_rec:
-                        extra = await asyncio.to_thread(_resolve_names, cap_url, [str(agent_id)])
-                        self_rec = extra.get(str(agent_id).lower())
-                    if self_rec:
-                        avatar_name = _pretty_name(self_rec, str(agent_id))
+            ids = [f["id"] for f in friends]
+            names = await asyncio.to_thread(_resolve_names, cap_url, ids)
+            for f in friends:
+                rec = names.get(f["id"].lower())
+                if rec:
+                    f["name"] = _pretty_name(rec, f["id"])
+            # Refresh avatar_name from resolver too (display name > legacy)
+            if agent_id:
+                self_rec = names.get(str(agent_id).lower())
+                if not self_rec:
+                    extra = await asyncio.to_thread(_resolve_names, cap_url, [str(agent_id)])
+                    self_rec = extra.get(str(agent_id).lower())
+                if self_rec:
+                    avatar_name = _pretty_name(self_rec, str(agent_id))
         except Exception as e:
             log.warning("display-name resolution skipped: %s", e)
 
@@ -499,12 +544,36 @@ async def login_grid(req: LoginRequest):
         "region": region,
         "look_at": str(look_at) if look_at is not None else None,
         "seed_capability": seed_cap,
+        "caps": caps,
+        "circuit_code": circuit_code,
+        "region_name": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.sessions.insert_one(dict(session_doc))
     if friends:
         await db.friends.insert_many([{**fr, "session_id": session_id} for fr in friends])
     await db.inventory.insert_many([{**it, "session_id": session_id} for it in inventory])
+
+    # Open the sim UDP circuit (presence, groups, chat, IMs).
+    if agent_id and sl_session and circuit_code and sim_ip and sim_port:
+        try:
+            circ = Circuit(
+                session_id=session_id,
+                agent_id=str(agent_id),
+                sl_session_id=str(sl_session),
+                circuit_code=int(circuit_code),
+                sim_ip=str(sim_ip),
+                sim_port=int(sim_port),
+                avatar_name=avatar_name,
+                caps=caps,
+                db=sync_db,
+            )
+            CIRCUITS[session_id] = circ
+            circ.start()
+        except Exception as e:
+            log.exception("could not start sim circuit")
+    else:
+        log.warning("login response missing circuit fields; running without sim circuit")
 
     return LoginResponse(
         ok=True,
@@ -527,11 +596,92 @@ async def login_grid(req: LoginRequest):
 
 @api.post("/logout")
 async def logout(session_id: str):
+    circ = CIRCUITS.pop(session_id, None)
+    if circ:
+        await asyncio.to_thread(circ.logout)
     await db.sessions.delete_one({"session_id": session_id})
     await db.friends.delete_many({"session_id": session_id})
     await db.inventory.delete_many({"session_id": session_id})
     await db.chat.delete_many({"session_id": session_id})
+    await db.groups.delete_many({"session_id": session_id})
     return {"ok": True}
+
+
+@api.get("/status")
+async def get_status(session_id: str):
+    """Live sim-circuit state for a session (offline sessions report mode only)."""
+    sess = await db.sessions.find_one({"session_id": session_id}, {"_id": 0, "mode": 1, "region_name": 1, "avatar_name": 1})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    circ = CIRCUITS.get(session_id)
+    if sess.get("mode") == "offline":
+        return {"mode": "offline", "connected": True, "region_name": "GridLink Sandbox", "avatar_name": sess.get("avatar_name")}
+    if not circ:
+        return {"mode": "grid", "connected": False, "closed": True, "error": "no circuit (backend restarted?) - log in again", "region_name": sess.get("region_name"), "avatar_name": sess.get("avatar_name")}
+    return {"mode": "grid", "avatar_name": sess.get("avatar_name"), **circ.status()}
+
+
+@api.get("/groups", response_model=List[Group])
+async def get_groups(session_id: str):
+    docs = await db.groups.find({"session_id": session_id}, {"_id": 0}).sort("name", 1).to_list(500)
+    return [Group(**d) for d in docs]
+
+
+@api.get("/im/conversations", response_model=List[Conversation])
+async def get_conversations(session_id: str):
+    pipeline = [
+        {"$match": {"session_id": session_id, "channel": "im"}},
+        {"$sort": {"ts": 1}},
+        {"$group": {"_id": "$scope", "name": {"$last": "$scope_name"}, "last_ts": {"$last": "$ts"}, "last_text": {"$last": "$text"}}},
+        {"$sort": {"last_ts": -1}},
+    ]
+    docs = await db.chat.aggregate(pipeline).to_list(200)
+    return [Conversation(id=d["_id"], name=d.get("name") or "Resident", last_ts=d["last_ts"], last_text=d.get("last_text") or "") for d in docs]
+
+
+@api.get("/search/residents", response_model=List[SearchResult])
+async def search_residents(session_id: str, q: str):
+    q = q.strip()
+    if len(q) < 2:
+        return []
+    sess = await db.sessions.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    friend_ids = {f["id"] async for f in db.friends.find({"session_id": session_id}, {"id": 1})}
+    if sess.get("mode") == "offline":
+        pool = ["Ruth Resident", "Governor Linden", "Torley Linden", "Philip Linden", "Magnum Resident",
+                "Oz Linden", "Ebbe Linden", "Rodvik Linden", "Grumpity Linden", "Patch Linden", "Vir Linden"]
+        hits = [{"id": _md5(n), "name": n, "username": n.lower().replace(" ", ".")} for n in pool if q.lower() in n.lower()]
+    else:
+        cap = (sess.get("caps") or {}).get("AvatarPickerSearch")
+        if not cap:
+            raise HTTPException(status_code=400, detail="Resident search capability unavailable for this session")
+        hits = await asyncio.to_thread(_search_residents, cap, q)
+    return [SearchResult(**h, is_friend=h["id"] in friend_ids) for h in hits]
+
+
+@api.post("/friends/request")
+async def request_friendship(req: FriendRequest):
+    sess = await db.sessions.find_one({"session_id": req.session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if sess.get("mode") == "offline":
+        await db.friends.update_one(
+            {"session_id": req.session_id, "id": req.agent_id},
+            {"$set": {"id": req.agent_id, "name": req.name or f"Resident {req.agent_id[:8]}", "online": True,
+                      "can_see_me_online": True, "can_see_me_map": False, "can_modify_my_objects": False}},
+            upsert=True,
+        )
+        return {"ok": True, "delivered": "offline"}
+    circ = CIRCUITS.get(req.session_id)
+    if not circ or not circ.connected:
+        raise HTTPException(status_code=503, detail="Not connected to the sim - log in again")
+    await asyncio.to_thread(circ.request_friendship, req.agent_id, req.message)
+    await db.chat.insert_one(ChatMessage(
+        session_id=req.session_id, channel="local", scope="local", scope_name="Local Chat",
+        sender="System", text=f"Friendship offered to {req.name or req.agent_id}", system=True,
+    ).model_dump())
+    return {"ok": True, "delivered": "grid"}
 
 
 @api.get("/session")
@@ -544,7 +694,7 @@ async def get_session(session_id: str):
 
 @api.get("/friends", response_model=List[Friend])
 async def get_friends(session_id: str):
-    docs = await db.friends.find({"session_id": session_id}, {"_id": 0, "session_id": 0}).to_list(500)
+    docs = await db.friends.find({"session_id": session_id}, {"_id": 0, "session_id": 0}).sort([("online", -1), ("name", 1)]).to_list(5000)
     return [Friend(**d) for d in docs]
 
 
@@ -559,7 +709,7 @@ async def refresh_friend_names(session_id: str):
     seed = sess.get("seed_capability")
     if not seed:
         raise HTTPException(status_code=400, detail="Session has no seed capability (offline mode?)")
-    friends = await db.friends.find({"session_id": session_id}, {"_id": 0}).to_list(500)
+    friends = await db.friends.find({"session_id": session_id}, {"_id": 0}).to_list(5000)
     if not friends:
         return {"updated": 0}
     cap_url = await asyncio.to_thread(_fetch_display_name_cap, str(seed))
@@ -610,12 +760,29 @@ async def send_chat(req: SendMessageRequest):
     session = await db.sessions.find_one({"session_id": req.session_id})
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    if session.get("mode") == "grid":
+        circ = CIRCUITS.get(req.session_id)
+        if not circ or not circ.connected:
+            raise HTTPException(status_code=503, detail="Not connected to the sim - log in again")
+        if req.channel == "local":
+            await asyncio.to_thread(circ.send_local_chat, text)
+        elif req.channel == "im":
+            await asyncio.to_thread(circ.send_im, req.scope, text)
+        else:
+            await asyncio.to_thread(circ.send_group_im, req.scope, text)
+
     msg = ChatMessage(
         session_id=req.session_id,
         channel=req.channel,
         scope=req.scope,
+        scope_name=req.scope_name or ("Local Chat" if req.channel == "local" else None),
         sender=session["avatar_name"],
-        text=req.text,
+        sender_id=session.get("agent_id"),
+        text=text,
     )
     await db.chat.insert_one(msg.model_dump())
 
@@ -625,6 +792,7 @@ async def send_chat(req: SendMessageRequest):
             session_id=req.session_id,
             channel="local",
             scope="local",
+            scope_name="Local Chat",
             sender="System",
             text=f"Local chat delivered on region 'GridLink Sandbox' (radius 20m).",
             system=True,
@@ -725,4 +893,10 @@ app.add_middleware(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
+    for circ in list(CIRCUITS.values()):
+        try:
+            circ.logout()
+        except Exception:
+            pass
+    CIRCUITS.clear()
     client.close()

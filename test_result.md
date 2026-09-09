@@ -101,3 +101,8 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+## Iteration 2 — Sim circuit (LLUDP) + IM names, group roster, presence, search & add
+Main agent added: backend `sl_circuit.py` (UDP circuit: UseCircuitCode/CompleteAgentMovement/AgentUpdate, handles OnlineNotification/OfflineNotification, AgentGroupDataUpdate, ChatFromSimulator, ImprovedInstantMessage; EventQueueGet long-poll thread), `llsd.py`.
+New endpoints: GET /api/status, GET /api/groups, GET /api/im/conversations, GET /api/search/residents?q=, POST /api/friends/request. POST /api/chat/send now sends over the circuit in grid mode (503 if not connected). Chat docs carry scope_name/sender_id; IM/group scopes are UUIDs.
+Frontend: chat.tsx (IM chips = online friends + conversations, group chips = real groups, ALL(n) chip opens ScopePicker modal, LINK badge, 4s chat poll), friends.tsx (30s presence poll, row → /chat?im=, account-plus → /search), new app/search.tsx, more.tsx sim link row.
+Manually verified against live grid (Kaleaon Resident): in-world on region Arapaima, 20 friends online, 53 groups, local chat sent, search works, logout OK.

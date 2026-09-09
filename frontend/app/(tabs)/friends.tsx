@@ -1,20 +1,13 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { View, Text, FlatList, Pressable, ActivityIndicator, RefreshControl } from "react-native";
-import { useRouter } from "expo-router";
+import { useFocusEffect, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Icon from "@react-native-vector-icons/material-design-icons";
 
-import { api, loadSession, type Session } from "@/src/api";
+import { api, loadSession, type Session, type Friend, type CircuitStatus } from "@/src/api";
 import { colors, makeStyles, monoFont, displayFont } from "@/src/theme";
 
-type Friend = {
-  id: string;
-  name: string;
-  online: boolean;
-  can_see_me_online: boolean;
-  can_see_me_map: boolean;
-  can_modify_my_objects: boolean;
-};
+const PRESENCE_POLL_MS = 30000;
 
 export default function FriendsScreen() {
   const insets = useSafeAreaInsets();
@@ -22,22 +15,33 @@ export default function FriendsScreen() {
   const router = useRouter();
   const [session, setSession] = useState<Session | null>(null);
   const [friends, setFriends] = useState<Friend[]>([]);
+  const [status, setStatus] = useState<CircuitStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [resolving, setResolving] = useState(false);
   const [filter, setFilter] = useState<"all" | "online">("all");
+  const [lastSync, setLastSync] = useState<Date | null>(null);
+  const sessionRef = useRef<Session | null>(null);
 
-  const load = async (s?: Session | null) => {
-    const sess = s ?? (await loadSession());
+  const load = useCallback(async (s?: Session | null, silent = false) => {
+    const sess = s ?? sessionRef.current ?? (await loadSession());
     if (!sess) return;
+    sessionRef.current = sess;
     setSession(sess);
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
-      const list = await api.get<Friend[]>(`/friends?session_id=${sess.session_id}`);
+      const [list, st] = await Promise.all([
+        api.get<Friend[]>(`/friends?session_id=${sess.session_id}`),
+        api.get<CircuitStatus>(`/status?session_id=${sess.session_id}`).catch(() => null),
+      ]);
       setFriends(list);
+      if (st) setStatus(st);
+      setLastSync(new Date());
+    } catch {
+      // keep last good list
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
-  };
+  }, []);
 
   const refreshNames = async () => {
     if (!session || session.mode !== "grid") return;
@@ -54,26 +58,41 @@ export default function FriendsScreen() {
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
+
+  // Presence: the sim pushes Online/OfflineNotification to the backend circuit;
+  // we re-pull the roster every 30s while this tab is focused.
+  useFocusEffect(
+    useCallback(() => {
+      load(undefined, true);
+      const t = setInterval(() => load(undefined, true), PRESENCE_POLL_MS);
+      return () => clearInterval(t);
+    }, [load]),
+  );
 
   const online = friends.filter((f) => f.online).length;
   const data = filter === "online" ? friends.filter((f) => f.online) : friends;
+  const connected = status?.connected ?? false;
+  const syncLabel = lastSync ? lastSync.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "--";
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
       <View style={styles.header}>
         <View style={{ flex: 1 }}>
           <Text style={styles.title}>FRIENDS</Text>
-          <Text style={styles.subtitle}>
-            {"> " + online + " online / " + friends.length + " total"}
+          <Text style={styles.subtitle} numberOfLines={1}>
+            {"> " + online + " online / " + friends.length + " total · " + (status ? (connected ? "live" : "no link") : "...") + " · sync " + syncLabel}
           </Text>
         </View>
+        <Pressable testID="open-search" onPress={() => router.push("/search")} style={styles.iconBtn} hitSlop={8}>
+          <Icon name="account-plus-outline" size={20} color={colors.brandPrimary} />
+        </Pressable>
         {session?.mode === "grid" ? (
           <Pressable
             testID="refresh-names"
             onPress={refreshNames}
             disabled={resolving}
-            style={styles.refreshBtn}
+            style={styles.iconBtn}
             hitSlop={8}
           >
             {resolving ? (
@@ -129,7 +148,7 @@ export default function FriendsScreen() {
           <Pressable
             testID={`friend-${item.id}`}
             style={styles.row}
-            onPress={() => router.push("/(tabs)/chat")}
+            onPress={() => router.push({ pathname: "/(tabs)/chat", params: { im: item.id, name: item.name } })}
           >
             <View style={[styles.dot, { backgroundColor: item.online ? colors.success : colors.muted }]} />
             <View style={{ flex: 1 }}>
@@ -143,7 +162,7 @@ export default function FriendsScreen() {
               {item.can_see_me_map && <Icon name="map-marker" size={14} color={colors.brandSecondary} />}
               {item.can_modify_my_objects && <Icon name="pencil" size={14} color={colors.brandSecondary} />}
             </View>
-            <Icon name="chevron-right" size={20} color={colors.brandPrimary} />
+            <Icon name="message-text-outline" size={20} color={colors.brandPrimary} />
           </Pressable>
         )}
       />
@@ -153,8 +172,8 @@ export default function FriendsScreen() {
 
 const useStyles = makeStyles((c) => ({
   root: { flex: 1, backgroundColor: c.surface },
-  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8, flexDirection: "row", alignItems: "center" },
-  refreshBtn: {
+  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8, flexDirection: "row", alignItems: "center", gap: 8 },
+  iconBtn: {
     width: 40,
     height: 40,
     borderRadius: 4,
