@@ -24,11 +24,14 @@ import hashlib
 import socket
 import time
 import uuid
+import asyncio
 import xmlrpc.client
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
+import requests
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -165,6 +168,109 @@ def _stable_hex(seed: str) -> str:
 def _clean(doc: Dict[str, Any]) -> Dict[str, Any]:
     doc.pop("_id", None)
     return doc
+
+
+# ---------------------------------------------------------------------------
+# SL Display Name resolution.
+# The XML-RPC login response's `buddy-list` only carries UUIDs and rights
+# flags - no names. Names come from the `GetDisplayNames` capability which
+# lives behind the login's `seed_capability`. Flow (per libremetaverse /
+# Firestorm):
+#   1. POST an LLSD array of wanted cap names to seed_capability
+#   2. Response is an LLSD map of cap_name -> cap_url; grab GetDisplayNames
+#   3. GET `${GetDisplayNames}?ids=uuid&ids=uuid&...` (batches <= 40)
+#   4. Response is an LLSD map with `agents` array containing username /
+#      display_name / legacy_first_name / legacy_last_name
+# ---------------------------------------------------------------------------
+def _llsd_request_caps_body(caps: List[str]) -> str:
+    items = "".join(f"<string>{c}</string>" for c in caps)
+    return f'<?xml version="1.0" ?><llsd><array>{items}</array></llsd>'
+
+
+def _llsd_map_get(map_elem: ET.Element, key: str) -> Optional[ET.Element]:
+    children = list(map_elem)
+    for i, ch in enumerate(children):
+        if ch.tag == "key" and ch.text == key and i + 1 < len(children):
+            return children[i + 1]
+    return None
+
+
+def _llsd_first_text(map_elem: ET.Element, key: str) -> Optional[str]:
+    node = _llsd_map_get(map_elem, key)
+    return node.text if node is not None else None
+
+
+def _fetch_display_name_cap(seed_cap: str) -> Optional[str]:
+    try:
+        r = requests.post(
+            seed_cap,
+            data=_llsd_request_caps_body(["GetDisplayNames"]),
+            headers={"Content-Type": "application/llsd+xml"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log.warning("seed cap returned %s", r.status_code)
+            return None
+        root = ET.fromstring(r.text)
+        m = root.find("map")
+        if m is None:
+            return None
+        return _llsd_first_text(m, "GetDisplayNames")
+    except Exception as e:
+        log.warning("failed to resolve display-name cap: %s", e)
+        return None
+
+
+def _resolve_names(display_name_cap: str, ids: List[str]) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    if not display_name_cap or not ids:
+        return out
+    for i in range(0, len(ids), 40):
+        batch = ids[i : i + 40]
+        try:
+            sep = "&" if "?" in display_name_cap else "?"
+            url = display_name_cap + sep + "&".join(f"ids={x}" for x in batch)
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                log.warning("GetDisplayNames returned %s", r.status_code)
+                continue
+            root = ET.fromstring(r.text)
+            m = root.find("map")
+            if m is None:
+                continue
+            agents_arr = _llsd_map_get(m, "agents")
+            if agents_arr is None:
+                continue
+            for agent_map in agents_arr.findall("map"):
+                a_id = _llsd_first_text(agent_map, "id") or ""
+                if not a_id:
+                    continue
+                out[a_id.lower()] = {
+                    "username": _llsd_first_text(agent_map, "username") or "",
+                    "display_name": _llsd_first_text(agent_map, "display_name") or "",
+                    "legacy_first_name": _llsd_first_text(agent_map, "legacy_first_name") or "",
+                    "legacy_last_name": _llsd_first_text(agent_map, "legacy_last_name") or "",
+                }
+        except Exception as e:
+            log.warning("name batch failed: %s", e)
+    return out
+
+
+def _pretty_name(rec: Dict[str, str], uuid_fallback: str) -> str:
+    display = (rec.get("display_name") or "").strip()
+    lfirst = (rec.get("legacy_first_name") or "").strip()
+    llast = (rec.get("legacy_last_name") or "").strip()
+    legacy = (f"{lfirst} {llast}").strip()
+    if display and legacy and display.lower() != legacy.lower():
+        return f"{display} ({legacy})"
+    if display:
+        return display
+    if legacy:
+        return legacy
+    username = (rec.get("username") or "").strip()
+    if username:
+        return username
+    return f"Resident {uuid_fallback[:8]}"
 
 
 def _xmlrpc_login(payload: Dict[str, Any], login_uri: str) -> Dict[str, Any]:
@@ -318,7 +424,7 @@ async def login_grid(req: LoginRequest):
     seed_cap = resp.get("seed_capability")
     login_msg = resp.get("message")
 
-    # Buddy list -> friends
+    # Buddy list -> friends (names come from GetDisplayNames cap below)
     buddies = resp.get("buddy-list") or []
     friends: List[Dict[str, Any]] = []
     for b in buddies:
@@ -329,12 +435,34 @@ async def login_grid(req: LoginRequest):
         rights_has = int(b.get("buddy_rights_has", 0) or 0)
         friends.append({
             "id": buddy_id,
-            "name": b.get("buddy_name") or f"Resident {buddy_id[:6]}",
+            "name": f"Resident {buddy_id[:8]}",
             "online": bool(rights_has & 1),
             "can_see_me_online": bool(rights_given & 1),
             "can_see_me_map": bool(rights_given & 2),
             "can_modify_my_objects": bool(rights_given & 4),
         })
+
+    # Resolve display names via seed_capability -> GetDisplayNames.
+    if seed_cap and friends:
+        try:
+            cap_url = await asyncio.to_thread(_fetch_display_name_cap, str(seed_cap))
+            if cap_url:
+                ids = [f["id"] for f in friends]
+                names = await asyncio.to_thread(_resolve_names, cap_url, ids)
+                for f in friends:
+                    rec = names.get(f["id"].lower())
+                    if rec:
+                        f["name"] = _pretty_name(rec, f["id"])
+                # Refresh avatar_name from resolver too (display name > legacy)
+                if agent_id:
+                    self_rec = names.get(str(agent_id).lower())
+                    if not self_rec:
+                        extra = await asyncio.to_thread(_resolve_names, cap_url, [str(agent_id)])
+                        self_rec = extra.get(str(agent_id).lower())
+                    if self_rec:
+                        avatar_name = _pretty_name(self_rec, str(agent_id))
+        except Exception as e:
+            log.warning("display-name resolution skipped: %s", e)
 
     # Inventory skeleton -> folders
     skel = resp.get("inventory-skeleton") or []
@@ -418,6 +546,50 @@ async def get_session(session_id: str):
 async def get_friends(session_id: str):
     docs = await db.friends.find({"session_id": session_id}, {"_id": 0, "session_id": 0}).to_list(500)
     return [Friend(**d) for d in docs]
+
+
+@api.post("/friends/refresh_names")
+async def refresh_friend_names(session_id: str):
+    """Re-resolve display names for every friend in a session using the stored
+    seed_capability. Useful when a session was created before name resolution
+    landed, or when a resident has since changed their display name."""
+    sess = await db.sessions.find_one({"session_id": session_id})
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    seed = sess.get("seed_capability")
+    if not seed:
+        raise HTTPException(status_code=400, detail="Session has no seed capability (offline mode?)")
+    friends = await db.friends.find({"session_id": session_id}, {"_id": 0}).to_list(500)
+    if not friends:
+        return {"updated": 0}
+    cap_url = await asyncio.to_thread(_fetch_display_name_cap, str(seed))
+    if not cap_url:
+        raise HTTPException(status_code=502, detail="GetDisplayNames capability unavailable")
+    ids = [f["id"] for f in friends]
+    if sess.get("agent_id"):
+        ids.append(str(sess["agent_id"]))
+    names = await asyncio.to_thread(_resolve_names, cap_url, ids)
+    updated = 0
+    for f in friends:
+        rec = names.get(f["id"].lower())
+        if rec:
+            new_name = _pretty_name(rec, f["id"])
+            if new_name != f.get("name"):
+                await db.friends.update_one(
+                    {"session_id": session_id, "id": f["id"]},
+                    {"$set": {"name": new_name}},
+                )
+                updated += 1
+    # Update session avatar name too
+    if sess.get("agent_id"):
+        self_rec = names.get(str(sess["agent_id"]).lower())
+        if self_rec:
+            new_self = _pretty_name(self_rec, str(sess["agent_id"]))
+            await db.sessions.update_one(
+                {"session_id": session_id},
+                {"$set": {"avatar_name": new_self}},
+            )
+    return {"updated": updated, "resolved": len(names)}
 
 
 @api.get("/inventory", response_model=List[InventoryFolder])

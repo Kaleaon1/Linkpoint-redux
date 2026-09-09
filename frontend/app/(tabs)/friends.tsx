@@ -23,6 +23,7 @@ export default function FriendsScreen() {
   const [session, setSession] = useState<Session | null>(null);
   const [friends, setFriends] = useState<Friend[]>([]);
   const [loading, setLoading] = useState(true);
+  const [resolving, setResolving] = useState(false);
   const [filter, setFilter] = useState<"all" | "online">("all");
 
   const load = async (s?: Session | null) => {
@@ -38,6 +39,19 @@ export default function FriendsScreen() {
     }
   };
 
+  const refreshNames = async () => {
+    if (!session || session.mode !== "grid") return;
+    setResolving(true);
+    try {
+      await api.post(`/friends/refresh_names?session_id=${session.session_id}`, {});
+      await load(session);
+    } catch {
+      // silent - endpoint reports 502 when cap unavailable
+    } finally {
+      setResolving(false);
+    }
+  };
+
   useEffect(() => {
     load();
   }, []);
@@ -48,10 +62,27 @@ export default function FriendsScreen() {
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
       <View style={styles.header}>
-        <Text style={styles.title}>FRIENDS</Text>
-        <Text style={styles.subtitle}>
-          {"> " + online + " online / " + friends.length + " total"}
-        </Text>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.title}>FRIENDS</Text>
+          <Text style={styles.subtitle}>
+            {"> " + online + " online / " + friends.length + " total"}
+          </Text>
+        </View>
+        {session?.mode === "grid" ? (
+          <Pressable
+            testID="refresh-names"
+            onPress={refreshNames}
+            disabled={resolving}
+            style={styles.refreshBtn}
+            hitSlop={8}
+          >
+            {resolving ? (
+              <ActivityIndicator color={colors.brandPrimary} size="small" />
+            ) : (
+              <Icon name="account-search-outline" size={20} color={colors.brandPrimary} />
+            )}
+          </Pressable>
+        ) : null}
       </View>
 
       <View style={styles.segment}>
@@ -122,7 +153,17 @@ export default function FriendsScreen() {
 
 const useStyles = makeStyles((c) => ({
   root: { flex: 1, backgroundColor: c.surface },
-  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8 },
+  header: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 8, flexDirection: "row", alignItems: "center" },
+  refreshBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 4,
+    borderWidth: 1,
+    borderColor: c.border,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: c.surfaceSecondary,
+  },
   title: { color: c.brandPrimary, fontFamily: displayFont, fontSize: 22, letterSpacing: 6, fontWeight: "700" },
   subtitle: { color: c.muted, fontFamily: monoFont, fontSize: 11, marginTop: 2 },
   segment: {
