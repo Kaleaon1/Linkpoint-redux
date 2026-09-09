@@ -44,7 +44,7 @@ export default function MoreScreen() {
   const logout = async () => {
     if (session) {
       try {
-        await fetch(`${process.env.EXPO_PUBLIC_BACKEND_URL}/api/logout?session_id=${session.session_id}`, { method: "POST" });
+        await api.post(`/logout?session_id=${session.session_id}`, {});
       } catch {}
     }
     await clearSession();
