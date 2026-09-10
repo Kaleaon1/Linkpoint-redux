@@ -93,6 +93,7 @@ export default function ChatScreen() {
 
   useEffect(() => {
     if (!session) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: load roster on mount, then poll
     loadRoster(session);
     const t = setInterval(() => loadRoster(session), ROSTER_POLL_MS);
     return () => clearInterval(t);
@@ -101,6 +102,7 @@ export default function ChatScreen() {
   // Deep-link from Friends tab: /chat?im=<agent_id>&name=<display name>
   useEffect(() => {
     if (!params.im) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: sync local state from the deep-link params
     setChannel("im");
     setScope(params.im);
     setPinned({ id: params.im, name: params.name || "Resident", kind: "im" });
@@ -144,6 +146,7 @@ export default function ChatScreen() {
   // Keep scope valid for the active channel.
   useEffect(() => {
     if (channel === "local") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: keep scope valid for the active channel
       if (scope !== "local") setScope("local");
       return;
     }
@@ -198,12 +201,14 @@ export default function ChatScreen() {
   };
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: (re)load whenever the channel/scope changes
     load();
   }, [load]);
 
   // Live: poll the active channel while this tab is focused.
   useEffect(() => {
     if (!isFocused) return;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: refresh immediately on focus, then poll
     load(true);
     const t = setInterval(() => load(true), CHAT_POLL_MS);
     return () => clearInterval(t);

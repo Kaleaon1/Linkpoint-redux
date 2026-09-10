@@ -54,8 +54,8 @@ export default function DiagnosticsScreen() {
   };
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: re-probe whenever the selected grid changes
     run(grid);
-    // eslint-disable-next-line
   }, [grid]);
 
   const latencyColor =

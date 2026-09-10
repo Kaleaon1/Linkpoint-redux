@@ -14,3 +14,11 @@ how to run it. Because raw UDP sockets aren't available in Expo Go, the app
 needs a custom dev client / EAS build (`npx expo run:android` /
 `npx expo run:ios`, or `eas build --profile development`) rather than the
 Expo Go app.
+
+## Testing
+
+`frontend/src/sl/__tests__/` has the automated test suite (`yarn test`),
+and `.github/workflows/ci.yml` runs it — along with a typecheck and lint —
+on every push and pull request. See `frontend/TESTING.md` for how to
+exercise the app itself without a device, in a browser or a GitHub
+Codespace.

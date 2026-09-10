@@ -56,7 +56,7 @@ const MSG_START_PING = high(1);
 const MSG_COMPLETE_PING = high(2);
 const MSG_AGENT_UPDATE = high(4);
 const MSG_COARSE_LOCATION = med(6);
-const MSG_CHAT_FROM_SIM = med(139);
+const MSG_CHAT_FROM_SIM = low(139); // per the official message template: Low 139, not Medium
 const MSG_USE_CIRCUIT = low(3);
 const MSG_CHAT_FROM_VIEWER = low(80);
 const MSG_AGENT_THROTTLE = low(81);
@@ -417,6 +417,8 @@ export class Circuit {
       var1(cstr(this.avatarName)),
       var2(cstr(text)),
       var2(bucket),
+      u32le(0), // EstateBlock.EstateID (unused, kept for wire-format completeness)
+      u8arr(0), // MetaData: 0-length variable block
     );
     this.send(body, true);
   }

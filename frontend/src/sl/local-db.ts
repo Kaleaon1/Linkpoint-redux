@@ -117,6 +117,11 @@ class Collection {
       }
     });
   }
+
+  /** Test-only: drop the in-memory cache so the next read re-fetches from AsyncStorage. */
+  __resetCache(): void {
+    this.cache = null;
+  }
 }
 
 class LocalDB {
@@ -127,6 +132,13 @@ class LocalDB {
   chat = new Collection("chat");
   friend_requests = new Collection("friend_requests");
   read_marks = new Collection("read_marks");
+
+  /** Test-only: call after AsyncStorage.clear() so cached collections don't serve stale data. */
+  __resetForTests(): void {
+    for (const col of Object.values(this)) {
+      if (col instanceof Collection) col.__resetCache();
+    }
+  }
 }
 
 export const db = new LocalDB();

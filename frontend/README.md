@@ -36,6 +36,13 @@ In the output, you'll find options to open the app in a
 
 You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
 
+## Testing
+
+`yarn test` runs the automated suite (`src/sl/__tests__/`, plus a few
+component tests). See [`TESTING.md`](./TESTING.md) for how to exercise the
+app itself — in a browser, no device needed — and what that does and
+doesn't cover.
+
 ## Get a fresh project
 
 When you're ready, run:

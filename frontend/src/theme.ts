@@ -2,7 +2,7 @@
 // All color literals live here. Components read tokens via useTheme() / makeStyles.
 
 import { useMemo } from "react";
-import { Appearance, Platform, StyleSheet, useColorScheme } from "react-native";
+import { Appearance, Platform, StyleSheet } from "react-native";
 
 export type ColorScheme = "light" | "dark";
 
@@ -54,13 +54,13 @@ export const monoFont = Platform.select({ ios: "Menlo", android: "monospace", de
 export const displayFont = Platform.select({ ios: "Avenir Next", android: "sans-serif-medium", default: "System" }) as string;
 
 export function setColorScheme(scheme: ColorScheme | null) {
-  Appearance.setColorScheme?.(scheme);
+  // RN's native API uses "unspecified" (not null) to mean "reset to system default".
+  Appearance.setColorScheme?.(scheme ?? "unspecified");
 }
 
 setColorScheme?.(defaultScheme);
 
 export function useTheme(): { scheme: ColorScheme; colors: ThemeColors } {
-  const system = useColorScheme();
   const scheme: ColorScheme = "dark";
   return { scheme, colors: themes.dark };
 }

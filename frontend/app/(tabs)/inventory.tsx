@@ -15,8 +15,6 @@ type Folder = {
   version: number;
 };
 
-type Node = Folder & { depth: number; children: Node[] };
-
 const ICON: Record<string, string> = {
   textures: "image-outline",
   texture: "image-outline",
@@ -66,6 +64,7 @@ export default function InventoryScreen() {
   };
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- deliberate: load inventory once on mount
     load();
   }, []);
 
